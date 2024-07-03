@@ -24,7 +24,9 @@ ENDORSER_AUTHOR = "author"
 ENDORSER_ENDORSER = "endorser"
 ENDORSER_NONE = "none"
 
-
+def read_hsm_config(file_path):
+    with open(file_path, 'r') as f:
+        return json.load(f)
 class ArgumentGroup(abc.ABC):
     """A class representing a group of related command line arguments."""
 
@@ -413,6 +415,7 @@ class DebugGroup(ArgumentGroup):
                 "Default: false."
             ),
         )
+    
 
     def get_settings(self, args: Namespace) -> dict:
         """Extract debug settings."""
@@ -526,6 +529,14 @@ class GeneralGroup(ArgumentGroup):
                 "this file *must* be in YAML format."
             ),
         )
+        # argumento do HSM
+        parser.add_argument(
+            "--hsm-config-file",
+            type=str,
+            help=("Path to the HSM config file",
+            ),
+        )
+
         parser.add_argument(
             "--plugin",
             dest="external_plugins",
@@ -648,7 +659,17 @@ class GeneralGroup(ArgumentGroup):
             env_var="ACAPY_UNIVERSAL_RESOLVER_BEARER_TOKEN",
             help="Bearer token if universal resolver instance requires authentication.",
         ),
+        if __name__ == "__main__":
+            parser = ArgumentParser()
+            group = GeneralGroup(parser)
+            args = parser.parse_args()
 
+            # Verifique se foi fornecido o argumento do HSM
+            if args.hsm_config_file:
+                config = read_hsm_config(args.hsm_config_file)
+                hsm_user = config.get('hsm_user')
+                hsm_password = config.get('hsm_password')
+    
     def get_settings(self, args: Namespace) -> dict:
         """Extract general settings."""
         settings = {}
