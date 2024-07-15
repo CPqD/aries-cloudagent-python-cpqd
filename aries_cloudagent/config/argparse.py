@@ -24,9 +24,7 @@ ENDORSER_AUTHOR = "author"
 ENDORSER_ENDORSER = "endorser"
 ENDORSER_NONE = "none"
 
-def read_hsm_config(file_path):
-    with open(file_path, 'r') as f:
-        return json.load(f)
+
 class ArgumentGroup(abc.ABC):
     """A class representing a group of related command line arguments."""
 
@@ -415,7 +413,6 @@ class DebugGroup(ArgumentGroup):
                 "Default: false."
             ),
         )
-    
 
     def get_settings(self, args: Namespace) -> dict:
         """Extract debug settings."""
@@ -511,7 +508,9 @@ class DiscoverFeaturesGroup(ArgumentGroup):
                         "goal-codes"
                     )
         return settings
-
+def read_hsm_config(file_path):
+    with open(file_path, 'r') as f:
+        return json.load(f)
 
 @group(CAT_PROVISION, CAT_START)
 class GeneralGroup(ArgumentGroup):
@@ -529,14 +528,6 @@ class GeneralGroup(ArgumentGroup):
                 "this file *must* be in YAML format."
             ),
         )
-        # argumento do HSM
-        parser.add_argument(
-            "--hsm-config-file",
-            type=str,
-            help=("Path to the HSM config file",
-            ),
-        )
-
         parser.add_argument(
             "--plugin",
             dest="external_plugins",
@@ -550,7 +541,13 @@ class GeneralGroup(ArgumentGroup):
                 "instances of this parameter can be specified."
             ),
         )
-
+        parser.add_argument(
+            "--hsm-config-file",
+            type=str,
+            help=("Path to the HSM config file"
+            ),
+        )
+       
         parser.add_argument(
             "--block-plugin",
             dest="blocked_plugins",
@@ -630,6 +627,12 @@ class GeneralGroup(ArgumentGroup):
             help="Specifies the profile endpoint for the (public) DID.",
         )
         parser.add_argument(
+            "--read-only-ledger",
+            action="store_true",
+            env_var="ACAPY_READ_ONLY_LEDGER",
+            help="Sets ledger to read-only to prevent updates. Default: false.",
+        )
+        parser.add_argument(
             "--universal-resolver",
             type=str,
             nargs="?",
@@ -659,16 +662,6 @@ class GeneralGroup(ArgumentGroup):
             env_var="ACAPY_UNIVERSAL_RESOLVER_BEARER_TOKEN",
             help="Bearer token if universal resolver instance requires authentication.",
         ),
-        if __name__ == "__main__":
-            parser = ArgumentParser()
-            group = GeneralGroup(parser)
-            args = parser.parse_args()
-
-            # Verifique se foi fornecido o argumento do HSM
-            if args.hsm_config_file:
-                config = read_hsm_config(args.hsm_config_file)
-                hsm_user = config.get('hsm_user')
-                hsm_password = config.get('hsm_password')
     
     def get_settings(self, args: Namespace) -> dict:
         """Extract general settings."""
@@ -706,6 +699,9 @@ class GeneralGroup(ArgumentGroup):
         if args.profile_endpoint:
             settings["profile_endpoint"] = args.profile_endpoint
 
+        if args.read_only_ledger:
+            settings["read_only_ledger"] = True
+
         if args.universal_resolver_regex and not args.universal_resolver:
             raise ArgsParseError(
                 "--universal-resolver-regex cannot be used without --universal-resolver"
@@ -728,7 +724,20 @@ class GeneralGroup(ArgumentGroup):
 
         return settings
 
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    group = GeneralGroup(parser)
+    args = parser.parse_args()  # Aqui você obtém os argumentos analisados
 
+    # Verifique se foi fornecido o argumento do HSM
+    if args.hsm_config_file:
+        print(f"Lendo configurações do HSM do arquivo: {args.hsm_config_file}")
+        config = read_hsm_config(args.hsm_config_file)
+        hsm_user = config.get('hsm_user')
+        hsm_password = config.get('hsm_password')
+        print(f"HSM User: {hsm_user}")
+        print(f"HSM Password: {hsm_password}")
+         
 @group(CAT_START, CAT_PROVISION)
 class RevocationGroup(ArgumentGroup):
     """Revocation settings."""
@@ -813,6 +822,81 @@ class LedgerGroup(ArgumentGroup):
 
     def add_arguments(self, parser: ArgumentParser):
         """Add ledger-specific command line arguments to the parser."""
+        # for besu
+        parser.add_argument(
+            "--account-address",
+            type=str,
+            metavar="<account>",
+            dest="account_address",
+            env_var="ACAPY_ACCOUNT_ADDRESS",
+            help=(
+                "Specifies the user address from besu. If the address doesn't "
+                "starts with 0x, this prefix is added."
+            ),
+        )
+        parser.add_argument(
+            "--private-account-key",
+            type=str,
+            metavar="<account>",
+            dest="private_account_key",
+            env_var="ACAPY_PRIVATE_ACCOUNT_KEY",
+            help=(
+                "Specifies the user account private key. If the key doesn't "
+                "starts with 0x, this prefix is added."
+            ),
+        )
+        parser.add_argument(
+            "--besu-provider-url",
+            type=str,
+            metavar="<besu>",
+            dest="besu_provider_url",
+            env_var="ACAPY_BESU_PROVIDER_URL",
+            help=("Specifies the url of the besu provider "),
+        )
+        parser.add_argument(
+            "--indy-did-contract-address",
+            type=str,
+            metavar="<account>",
+            dest="indy_did_contract_address",
+            env_var="ACAPY_INDY_DID_CONTRACT_ADDRESS",
+            help=(
+                "Specifies the DID registry contract address. If the address doesn't "
+                "starts with 0x, this prefix is added."
+            ),
+        )
+        parser.add_argument(
+            "--schema-contract-address",
+            type=str,
+            metavar="<contract>",
+            dest="schema_contract_address",
+            env_var="ACAPY_SCHEMA_CONTRACT_ADDRESS",
+            help=(
+                "Specifies the schema contract address. If the address doesn't "
+                "starts with 0x, this prefix is added."
+            ),
+        )
+        parser.add_argument(
+            "--credef-contract-address",
+            type=str,
+            metavar="<contract>",
+            dest="credef_contract_address",
+            env_var="ACAPY_CREDF_CONTRACT_ADDRESS",
+            help=(
+                "Specifies the credf contract address. If the address doesn't "
+                "starts with 0x, this prefix is added."
+            ),
+        )
+        parser.add_argument(
+            "--revocation-contract-address",
+            type=str,
+            metavar="<account>",
+            dest="revocation_contract_address",
+            env_var="ACAPY_REVOCATION_CONTRACT_ADDRESS",
+            help=(
+                "Specifies the revocation contract address. If the address doesn't "
+                "starts with 0x, this prefix is added."
+            ),
+        )
         parser.add_argument(
             "--ledger-pool-name",
             type=str,
@@ -868,12 +952,6 @@ class LedgerGroup(ArgumentGroup):
             ),
         )
         parser.add_argument(
-            "--read-only-ledger",
-            action="store_true",
-            env_var="ACAPY_READ_ONLY_LEDGER",
-            help="Sets ledger to read-only to prevent updates. Default: false.",
-        )
-        parser.add_argument(
             "--ledger-keepalive",
             default=5,
             type=BoundedInt(min=5),
@@ -923,16 +1001,46 @@ class LedgerGroup(ArgumentGroup):
     def get_settings(self, args: Namespace) -> dict:
         """Extract ledger settings."""
         settings = {}
+
         if args.no_ledger:
             settings["ledger.disabled"] = True
+        elif args.besu_provider_url:
+            settings["ledger.besu_provider_url"] = args.besu_provider_url
+            settings["ledger.private_account_key"] = (
+                args.private_account_key
+                if args.private_account_key.startswith("0x")
+                else f"0x{args.private_account_key}"
+            )
+            settings["ledger.account_address"] = (
+                args.account_address
+                if args.account_address.startswith("0x")
+                else f"0x{args.account_address}"
+            )
+            settings["ledger.schema_contract_address"] = (
+                args.schema_contract_address
+                if args.schema_contract_address.startswith("0x")
+                else f"0x{args.schema_contract_address}"
+            )
+            settings["ledger.credef_contract_address"] = (
+                args.credef_contract_address
+                if args.credef_contract_address.startswith("0x")
+                else f"0x{args.credef_contract_address}"
+            )
+            settings["ledger.revocation_contract_address"] = (
+                args.revocation_contract_address
+                if args.revocation_contract_address.startswith("0x")
+                else f"0x{args.revocation_contract_address}"
+            )
+            settings["ledger.indy_did_contract_address"] = (
+                args.indy_did_contract_address
+                if args.indy_did_contract_address.startswith("0x")
+                else f"0x{args.indy_did_contract_address}"
+            )
         else:
             single_configured = False
             multi_configured = False
             update_pool_name = False
             write_ledger_specified = False
-
-            if args.read_only_ledger:
-                settings["read_only_ledger"] = True
             if args.genesis_url:
                 settings["ledger.genesis_url"] = args.genesis_url
                 single_configured = True
@@ -961,7 +1069,7 @@ class LedgerGroup(ArgumentGroup):
                             txn_config["pool_name"] = txn_config["id"]
                         update_pool_name = True
                         ledger_config_list.append(txn_config)
-                    if not write_ledger_specified and not args.read_only_ledger:
+                    if not write_ledger_specified:
                         raise ArgsParseError(
                             "No write ledger genesis provided in multi-ledger config"
                         )
@@ -1032,6 +1140,15 @@ class LoggingGroup(ArgumentGroup):
                 "('debug', 'info', 'warning', 'error', 'critical')"
             ),
         )
+        parser.add_argument(
+            "--supress-healthcheck-log",
+            action="store_true",
+            env_var="ACAPY_SUPRESS_HEALTHCHECK_LOG",
+            help=(
+                "Supress the output for requests to /status/live and "
+                "/status/ready endpoints"
+            ),
+        )
 
     def get_settings(self, args: Namespace) -> dict:
         """Extract logging settings."""
@@ -1042,6 +1159,8 @@ class LoggingGroup(ArgumentGroup):
             settings["log.file"] = args.log_file
         if args.log_level:
             settings["log.level"] = args.log_level
+        settings["log.supress-healthcheck-log"] = args.supress_healthcheck_log
+
         return settings
 
 
@@ -1253,7 +1372,6 @@ class ProtocolGroup(ArgumentGroup):
         if args.exch_use_unencrypted_tags:
             settings["exch_use_unencrypted_tags"] = True
             environ["EXCH_UNENCRYPTED_TAGS"] = "True"
-
         return settings
 
 
@@ -1703,13 +1821,13 @@ class WalletGroup(ArgumentGroup):
             settings["wallet.replace_public_did"] = True
         if args.recreate_wallet:
             settings["wallet.recreate"] = True
-        # check required settings for persistent wallets
+        # check required settings for 'indy' wallets
         if settings["wallet.type"] in ["indy", "askar", "askar-anoncreds"]:
             # requires name, key
             if not args.wallet_name or not args.wallet_key:
                 raise ArgsParseError(
                     "Parameters --wallet-name and --wallet-key must be provided "
-                    "for persistent wallets"
+                    "for indy wallets"
                 )
             # postgres storage requires additional configuration
             if (
