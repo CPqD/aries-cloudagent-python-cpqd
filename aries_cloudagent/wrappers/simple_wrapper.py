@@ -7,8 +7,8 @@ libdinamo = ctypes.CDLL('/usr/lib/libdinamo.so')
 
 # Define constants
 HOST_ADDR = "10.202.40.16"
-USER_ID = "caios"
-USER_PWD = "F@c20052023"
+USER_ID = ""
+USER_PWD = ""
 #USER_PWD = getpass("PASS: ")
 KEY_ID = "Teste"
 KEY_TYPE = 201  # ALG_3DES_168 in your specific context
