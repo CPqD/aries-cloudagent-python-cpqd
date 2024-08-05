@@ -32,6 +32,79 @@ class AUTH_PWD(Structure):
                 ("szUserId", c_char * MAX_USR_LEN),
                 ("szPassword", c_char * MAX_USR_PWD)]
 
+class DinamoWrapper:
+    def __init__(self):
+        self.libdinamo = self._load_library()
+        self.KEY_ID = KEY_ID
+        self.KEY_TYPE = KEY_TYPE
+        self.FLAGS = FLAGS
+
+    def _load_library(self):
+        """Carregar a biblioteca compartilhada Dinamo"""
+        try:
+            libdinamo = ctypes.CDLL('/usr/lib/libdinamo.so')
+            return libdinamo
+        except OSError as e:
+            raise RuntimeError(f"Failed to load library: {e}")
+
+    def initialize(self):
+        """Inicializar a biblioteca Dinamo"""
+        ret = self.libdinamo.DInitialize(0)
+        if ret:
+            raise RuntimeError(f"Dinamo initialization failed with code: {ret}")
+        print("Bibliotecas inicializadas.")
+
+    def open_session(self):
+        """Abrir uma sessão"""
+        authPwd = AUTH_PWD()
+        authPwd.szAddr = (HOST_ADDR + '\0' * (MAX_ADDR_LEN - len(HOST_ADDR))).encode('utf-8')
+        authPwd.nPort = DEFAULT_PORT
+        authPwd.szUserId = (USER_ID + '\0' * (MAX_USR_LEN - len(USER_ID))).encode('utf-8')
+        authPwd.szPassword = (USER_PWD + '\0' * (MAX_USR_PWD - len(USER_PWD))).encode('utf-8')
+
+        hSession = c_void_p()
+        ret = self.libdinamo.DOpenSession(byref(hSession), SS_USER_PWD, byref(authPwd), ctypes.sizeof(authPwd), ENCRYPTED_CONN)
+        if ret:
+            raise RuntimeError(f"Failed to open session with code: {ret}")
+        print("Sessao com o Dinamo estabelecida.")
+        return hSession
+
+    def generate_key(self, session):
+        """Gerar uma chave"""
+        hKey = c_void_p()
+        ret = self.libdinamo.DGenerateKey(session, self.KEY_ID.encode('utf-8'), self.KEY_TYPE, self.FLAGS, byref(hKey))
+        if ret:
+            raise RuntimeError(f"Failed to generate key with code: {ret}")
+        print("Chave criada com sucesso.")
+        return hKey
+
+    def get_key_value(self, session, key_handle):
+        """Obter o valor da chave gerada"""
+        key_value_len = c_void_p()
+        ret = self.libdinamo.DGetKeyValue(session, key_handle, None, byref(key_value_len))
+        if ret:
+            raise RuntimeError(f"Failed to get key value length with code: {ret}")
+
+        key_value = (ctypes.c_ubyte * key_value_len.value)()
+        ret = self.libdinamo.DGetKeyValue(session, key_handle, key_value, byref(key_value_len))
+        if ret:
+            raise RuntimeError(f"Failed to get key value with code: {ret}")
+
+        return bytes(key_value)
+
+    def close_session(self, session):
+        """Encerrar a sessão"""
+        if session:
+            ret = self.libdinamo.DCloseSession(byref(session), 0)
+            if ret:
+                raise RuntimeError(f"Failed to close session with code: {ret}")
+            print("Sessao encerrada.")
+
+    def finalize(self):
+        """Finalizar a biblioteca Dinamo"""
+        self.libdinamo.DFinalize()
+        print("Bibliotecas finalizada.")
+
 # Define the function prototypes
 libdinamo.DInitialize.argtypes = [c_int]
 libdinamo.DInitialize.restype = c_int
