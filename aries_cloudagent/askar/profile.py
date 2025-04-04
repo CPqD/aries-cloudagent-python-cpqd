@@ -55,7 +55,7 @@ class AskarProfile(Profile):
     @property
     def name(self) -> str:
         """Accessor for the profile name."""
-        return self.opened.name
+        return self.profile_id or self.opened.name
 
     @property
     def store(self) -> Store:
@@ -114,11 +114,11 @@ class AskarProfile(Profile):
                 "aries_cloudagent.indy.credx.issuer.IndyCredxIssuer", ref(self)
             ),
         )
-        injector.bind_provider(
+        injector.soft_bind_provider(
             VCHolder,
             ClassProvider(
                 "aries_cloudagent.storage.vc_holder.askar.AskarVCHolder",
-                ref(self),
+                ClassProvider.Inject(Profile),
             ),
         )
         if (

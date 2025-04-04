@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "aries_cloudagent"
-version = "0.12.1rc1+cpqd1"
+version = "0.12.6+cpqd1"
 description = "Hyperledger Aries Cloud Agent Python (ACA-Py) is a foundation for building decentralized identity applications and services running in non-mobile environments. "
 authors = ["Hyperledger Aries <aries@lists.hyperledger.org>","Antonio Mateus <amateus@cpqd.com.br>"]
 license = "Apache-2.0"
@@ -51,7 +51,7 @@ did-peer-2 = "^0.1.2"
 did-peer-4 = "^0.1.4"
 
 # askar
-aries-askar= { version = "~0.3.0", optional = true }
+aries-askar= { version = "~0.4.3", optional = true }
 indy-credx= { version = "~1.1.1", optional = true }
 indy-vdr= { version = "~0.4.0", optional = true }
 anoncreds= { version = "0.2.0", optional = true }

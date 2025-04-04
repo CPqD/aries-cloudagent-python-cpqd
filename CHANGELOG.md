@@ -1,16 +1,122 @@
 # Aries Cloud Agent Python Changelog
 
-## 0.12.1rc1
+## 0.12.6
 
-### April 26, 2024
+### March 13, 2025
 
-Release 0.12.1rc1 is a small patch to cleanup some edge case issues in the handling of Out of Band invitations, revocation notification webhooks, and connection querying uncovered after the 0.12.0 release. Fixes and improvements were also made to the generation of ACA-Py's OpenAPI specifications.
+This patch release addresses a bug in the handling connection reuse in multitenancy environments. This is a backport of the PR [fix: connection reuse with multi-tenancy #3543](https://github.com/openwallet-foundation/acapy/pull/3543). This fixes the issue when using multi-tenancy, calls to `POST /out-of-band/receive-invitation?use_existing_connection=true` failing with a record not found error, despite connection reuse actually being completed in the background.
 
-### 0.12.1rc1 Breaking Changes
+### 0.12.6 Breaking Changes
 
 There are no breaking changes in this release.
 
-#### 0.12.1rc1 Categorized List of Pull Requests
+#### 0.12.6 Categorized List of Pull Requests
+
+- Multitenancy Fixes
+  - fix: cherry-pick fixes from main to 0.12.lts [\#3578](https://github.com/openwallet-foundation/acapy/pull/3578) [thiagoromanos](https://github.com/thiagoromanos)
+
+- Release management pull requests:
+  - 0.12.6 [\#3583](https://github.com/openwallet-foundation/acapy/pull/3583) [swcurran](https://github.com/swcurran)
+
+## 0.12.5
+
+### March 6, 2025
+
+This patch release addresses a bug in the publishing of AnonCreds revocation entries that caused the ledger and issuer wallet to become out of sync. As a result, revoked credentials were not being correctly flagged as revoked when presented. Previously, this issue was mitigated by an automatic “sync-revocation” process, which generally resolved the problem. However, we recently identified scenarios where the presence of an Indy Endorser in the revocation publication flow caused the “sync-revocation” process to fail silently.
+
+This patch resolves that issue. Once applied, if a revocation batch results in an out-of-sync state, the “sync-revocation” process will automatically run to correct it.
+
+For more details, see [Issue 3546](https://github.com/openwallet-foundation/acapy/issues/3546).
+
+### 0.12.5 Breaking Changes
+
+There are no breaking changes in this release.
+
+#### 0.12.5 Categorized List of Pull Requests
+
+- AnonCreds Revocation Fixes
+  - 0.12.lts Patch the fix_ledger_entry improvements [\#3558](https://github.com/openwallet-foundation/acapy/pull/3558) [jamshale](https://github.com/jamshale)
+  - 0.12.lts Fix revocation accum sync when endorsement txn fails (#3547) [\#3554](https://github.com/openwallet-foundation/acapy/pull/3554) [jamshale](https://github.com/jamshale)
+
+- Release management pull requests:
+  - 0.12.5 [\#3560](https://github.com/openwallet-foundation/acapy/pull/3560) [swcurran](https://github.com/swcurran)
+
+## 0.12.4
+
+### January 30, 2025
+
+A patch release to upgrade [Askar](https://github.com/openwallet-foundation/askar) to [0.4.3](https://github.com/openwallet-foundation/askar/releases/tag/v0.4.3) and fixes a problem with wallet names in a multitenant, single-wallet configuration.
+
+Addresses the problem outlined in [#3471](https://github.com/openwallet-foundation/acapy/issues/3471) around profiles in multi-tenant/single wallet deployments. The update to Askar addresses an intermittent hang on startup, and a dependency change that can result in a substantial performance improvement in some cases. See issues: [openwallet-foundation/askar#350](https://github.com/openwallet-foundation/askar/pull/350), [openwallet-foundation/askar#351](https://github.com/openwallet-foundation/askar/pull/351), [openwallet-foundation/askar#354](https://github.com/openwallet-foundation/askar/pull/354). This [comment on one of the PRs](https://github.com/openwallet-foundation/askar/pull/350#issuecomment-2615727109) describes the scenario where a substantial performance improvement was seen as a result of the change in Askar.
+
+### 0.12.4 Breaking Changes
+
+There are no breaking changes in this release.
+
+#### 0.12.4 Categorized List of Pull Requests
+
+- Multitenant Single Wallet Configurations
+  - 0.12 LTS: Askar upgrade and fix profile unique names [\#3475](https://github.com/openwallet-foundation/acapy/pull/3475)
+- Release management pull requests
+  - 0.12.4 [\#3481](https://github.com/hyperledger/aries-cloudagent-python/pull/3481) [swcurran](https://github.com/swcurran)
+
+## 0.12.3
+
+### December 17, 2024
+
+A patch release to add address a bug found in the Linked Data Verifiable Credential handling for multi-tenant holders. The bug was fixed in the main branch, [PR 3391 - BREAKING: VCHolder multitenant binding](https://github.com/openwallet-foundation/acapy/pull/3391), and with this release is backported to 0.12 Long Term Support branch. Prior to this release, holder credentials received into a tenant wallet were actually received into the multi-tenant admin wallet.
+
+### 0.12.3 Breaking Changes
+
+There are no breaking changes in this release.
+
+#### 0.12.3 Categorized List of Pull Requests
+
+- Multitenant LD-VC Holders
+  - Patch PR 3391 - 0.12.lts [\#3396](https://github.com/openwallet-foundation/acapy/pull/3396)
+- Release management pull requests
+  - 0.12.3 [\#3408](https://github.com/hyperledger/aries-cloudagent-python/pull/3408) [swcurran](https://github.com/swcurran)
+  - 0.12.3rc0 [\#3406](https://github.com/hyperledger/aries-cloudagent-python/pull/3406) [swcurran](https://github.com/swcurran)
+
+## 0.12.2
+
+### August 2, 2024
+
+A patch release to add the verification of a linkage between an inbound message and its associated connection (if any) before processing the message. Also adds some additional cleanup/fix PRs from the main branch (see list below) that might be useful for deployments currently using [Release 0.12.1](#0121) or [0.12.0](#0120).
+
+### 0.12.2 Breaking Changes
+
+There are no breaking changes in this release.
+
+#### 0.12.2 Categorized List of Pull Requests
+
+- Dependency update and release PR
+  - [ PATCH ] 0.12.x with PR 3081 terse webhooks [\#3141](https://github.com/hyperledger/aries-cloudagent-python/pull/3141) [jamshale](https://github.com/jamshale)
+  - Patch release 0.12.x [\#3121](https://github.com/hyperledger/aries-cloudagent-python/pull/3121) [jamshale](https://github.com/jamshale)
+- Release management pull requests
+  - 0.12.2 [\#3145](https://github.com/hyperledger/aries-cloudagent-python/pull/3145) [swcurran](https://github.com/swcurran)
+  - 0.12.2rc1 [\#3123](https://github.com/hyperledger/aries-cloudagent-python/pull/3123) [swcurran](https://github.com/swcurran)
+- PRs cherry-picked into [\#3121](https://github.com/hyperledger/aries-cloudagent-python/pull/3120) from the `main` branch:
+  - fix: multiuse invites with did peer 4 [\#3112](https://github.com/hyperledger/aries-cloudagent-python/pull/3112) [dbluhm](https://github.com/dbluhm)
+  - Check connection is ready in all connection required handlers [\#3095](https://github.com/hyperledger/aries-cloudagent-python/pull/3095) [jamshale](https://github.com/jamshale)
+  - Add by_format to terse webhook for presentations [\#3081](https://github.com/hyperledger/aries-cloudagent-python/pull/3081) [ianco](https://github.com/ianco)
+  - fix: respond to did:peer:1 with did:peer:4 [\#3050](https://github.com/hyperledger/aries-cloudagent-python/pull/3050) [dbluhm](https://github.com/dbluhm)
+  - feat: soft binding for plugin flexibility [\#3010](https://github.com/hyperledger/aries-cloudagent-python/pull/3010) [dbluhm](https://github.com/dbluhm)
+  - feat: inject profile and session [\#2997](https://github.com/hyperledger/aries-cloudagent-python/pull/2997) [dbluhm](https://github.com/dbluhm)
+  - feat: external signature suite provider interface [\#2835](https://github.com/hyperledger/aries-cloudagent-python/pull/2835) [dbluhm](https://github.com/dbluhm)
+  - fix(interop): overly strict validation [\#2943](https://github.com/hyperledger/aries-cloudagent-python/pull/2943) [dbluhm](https://github.com/dbluhm)
+
+## 0.12.1
+
+### April 26, 2024
+
+Release 0.12.1 is a small patch to cleanup some edge case issues in the handling of Out of Band invitations, revocation notification webhooks, and connection querying uncovered after the 0.12.0 release. Fixes and improvements were also made to the generation of ACA-Py's OpenAPI specifications.
+
+### 0.12.1 Breaking Changes
+
+There are no breaking changes in this release.
+
+#### 0.12.1 Categorized List of Pull Requests
 
 - Out of Band Invitations and Connection Establishment updates/fixes:
   - 🐛 Fix ServiceDecorator parsing in oob record handling [\#2910](https://github.com/hyperledger/aries-cloudagent-python/pull/2910) [ff137](https://github.com/ff137)
@@ -40,6 +146,7 @@ There are no breaking changes in this release.
   - Update GHA so that broken image links work on docs site - without breaking them on GitHub [\#2852](https://github.com/hyperledger/aries-cloudagent-python/pull/2852) [swcurran](https://github.com/swcurran)
 
 - Dependencies and Internal Updates:
+  - chore(deps): Bump psf/black from 24.4.0 to 24.4.2 in the all-actions group [\#2924](https://github.com/hyperledger/aries-cloudagent-python/pull/2924) [dependabot bot](https://github.com/dependabot bot)
   - fix: fixes a regression that requires a log file in multi-tenant mode [\#2918](https://github.com/hyperledger/aries-cloudagent-python/pull/2918) [amanji](https://github.com/amanji)
   - Update AnonCreds to 0.2.2 [\#2917](https://github.com/hyperledger/aries-cloudagent-python/pull/2917) [swcurran](https://github.com/swcurran)
   - chore(deps): Bump aiohttp from 3.9.3 to 3.9.4  dependencies python [\#2902](https://github.com/hyperledger/aries-cloudagent-python/pull/2902) [dependabot bot](https://github.com/dependabot bot)
@@ -49,6 +156,7 @@ There are no breaking changes in this release.
   - refactor: logging configs setup [\#2870](https://github.com/hyperledger/aries-cloudagent-python/pull/2870) [amanji](https://github.com/amanji)
 
 - Release management pull requests:
+  - 0.12.1 [\#2926](https://github.com/hyperledger/aries-cloudagent-python/pull/2926) [swcurran](https://github.com/swcurran)
   - 0.12.1rc1 [\#2921](https://github.com/hyperledger/aries-cloudagent-python/pull/2921) [swcurran](https://github.com/swcurran)
   - 0.12.1rc0 [\#2912](https://github.com/hyperledger/aries-cloudagent-python/pull/2912) [swcurran](https://github.com/swcurran)
 

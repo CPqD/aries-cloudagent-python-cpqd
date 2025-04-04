@@ -1,8 +1,8 @@
 """Handler for revoke message."""
 
 from aries_cloudagent.protocols.didcomm_prefix import DIDCommPrefix
+from .....messaging.base_handler import BaseHandler, HandlerException
 
-from .....messaging.base_handler import BaseHandler
 from .....messaging.request_context import RequestContext
 from .....messaging.responder import BaseResponder
 from ..messages.revoke import Revoke
@@ -18,6 +18,10 @@ class RevokeHandler(BaseHandler):
     async def handle(self, context: RequestContext, responder: BaseResponder):
         """Handle revoke message."""
         assert isinstance(context.message, (Revoke, Unrevoke))
+
+        if not context.connection_ready:
+            raise HandlerException("No connection established")
+
         self._logger.debug(
             "Received notification of revocation for %s cred %s with comment: %s",
             context.message.revocation_format,
