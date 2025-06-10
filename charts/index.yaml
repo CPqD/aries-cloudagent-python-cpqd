@@ -1,0 +1,8 @@
+apiVersion: v2
+entries:
+  acapy:
+    - appVersion: "1.2.4"
+      version: 0.1.0
+      name: acapy
+      urls:
+        - https://cpqd.github.io/aries-cloudagent-python-cpqd/acapy-0.1.0.tgz
