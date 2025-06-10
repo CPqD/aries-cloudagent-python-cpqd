@@ -5,4 +5,4 @@ entries:
       version: 0.1.0
       name: acapy
       urls:
-        - https://cpqd.github.io/aries-cloudagent-python-cpqd/acapy-0.1.0.tgz
+        - https://cpqd.github.io/aries-cloudagent-python-cpqd/charts/acapy-0.1.0.tgz
