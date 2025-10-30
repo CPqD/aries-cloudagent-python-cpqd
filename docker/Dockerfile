@@ -1,4 +1,4 @@
-ARG python_version=3.9.20
+ARG python_version=3.12
 ARG base_os=bookworm
 FROM python:${python_version}-slim-${base_os} AS build
 
