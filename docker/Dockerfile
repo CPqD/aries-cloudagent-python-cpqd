@@ -7,7 +7,6 @@ WORKDIR /src
 ADD . .
 
 RUN pip install --no-cache-dir poetry
-RUN pip install --no-cache-dir --upgrade setuptools==78.1.1 wheel
 RUN poetry build
 
 FROM python:${python_version}-slim-${base_os} AS main
@@ -28,7 +27,7 @@ ENV HOME="/home/$user" \
     SHELL=/bin/bash \
     SUMMARY="aries-cloudagent image" \
     DESCRIPTION="aries-cloudagent provides a base image for running Hyperledger Aries agents in Docker. \
-    This image layers the python implementation of aries-cloudagent $acapy_version. Based on Debian Buster."
+    This image layers the python implementation of aries-cloudagent $acapy_version. Based on Debian Bookworm."
 
 LABEL summary="$SUMMARY" \
     description="$DESCRIPTION" \
@@ -49,18 +48,19 @@ RUN apt-get update -y && \
     build-essential \
     bzip2 \
     curl \
+    git \
     less \
     libffi-dev \
     libgmp10 \
     liblzma5 \
     libncurses5 \
     libncursesw5 \
+    libsecp256k1-1 \
     libzmq5 \
     net-tools \
     openssl \
     sqlite3 \
     zlib1g && \
-    apt-get upgrade -y && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* /usr/share/doc/*
 
@@ -90,7 +90,6 @@ RUN chown -R $user:root $HOME/.indy_client $HOME/.aries_cloudagent && \
 # Create /home/indy and symlink .indy_client folder for backwards compatibility with artifacts created on older indy-based images.
 RUN mkdir -p /home/indy
 RUN ln -s /home/aries/.indy_client /home/indy/.indy_client
-RUN python -m pip install --upgrade pip setuptools==78.1.1 wheel || true
 
 # Install ACA-py from the wheel as $user,
 # and ensure the permissions on the python 'site-packages' and $HOME/.local folders are set correctly.
@@ -100,12 +99,9 @@ RUN aries_cloudagent_package=$(find ./ -name "aries_cloudagent*.whl" | head -n 1
     echo "Installing ${aries_cloudagent_package} ..." && \
     pip install --no-cache-dir --find-links=. ${aries_cloudagent_package}${acapy_reqs} && \
     rm aries_cloudagent*.whl && \
-    python -m pip install --user --upgrade pip setuptools wheel && \
-    python -m pip install --user --upgrade --no-cache-dir setuptools==78.1.1 || true && \
-    python -m pip install --user --upgrade --no-cache-dir ecdsa==0.19.1 || true && \
     chmod +rx $(python -m site --user-site) $HOME/.local
 
-# Clean-up unneccessary build dependencies and reduce final image size
+# Clean-up unneccessary build dependencies and reduce image size
 USER root
 RUN apt-get purge -y --auto-remove build-essential
 RUN dpkg -r --force-all apt apt-get && dpkg -r --force-all debconf dpkg
