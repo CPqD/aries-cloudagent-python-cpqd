@@ -1,5 +1,6 @@
-ARG python_version=3.9.20
-FROM python:${python_version}-slim-bullseye AS build
+ARG python_version=3.12
+ARG base_os=bookworm
+FROM python:${python_version}-slim-${base_os} AS build
 
 WORKDIR /src
 
@@ -8,7 +9,7 @@ ADD . .
 RUN pip install --no-cache-dir poetry
 RUN poetry build
 
-FROM python:${python_version}-slim-bullseye AS main
+FROM python:${python_version}-slim-${base_os} AS main
 
 ARG uid=1001
 ARG user=aries
@@ -26,7 +27,7 @@ ENV HOME="/home/$user" \
     SHELL=/bin/bash \
     SUMMARY="aries-cloudagent image" \
     DESCRIPTION="aries-cloudagent provides a base image for running Hyperledger Aries agents in Docker. \
-    This image layers the python implementation of aries-cloudagent $acapy_version. Based on Debian Buster."
+    This image layers the python implementation of aries-cloudagent $acapy_version. Based on Debian Bookworm."
 
 LABEL summary="$SUMMARY" \
     description="$DESCRIPTION" \
@@ -54,12 +55,13 @@ RUN apt-get update -y && \
     liblzma5 \
     libncurses5 \
     libncursesw5 \
-    libsecp256k1-0 \
+    libsecp256k1-1 \
     libzmq5 \
     net-tools \
     openssl \
     sqlite3 \
     zlib1g && \
+    apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* /usr/share/doc/*
 
 WORKDIR $HOME
@@ -85,7 +87,7 @@ RUN mkdir -p \
 RUN chown -R $user:root $HOME/.indy_client $HOME/.aries_cloudagent && \
     chmod -R ug+rw $HOME/log $HOME/ledger $HOME/.aries_cloudagent $HOME/.cache $HOME/.indy_client
 
-# Create /home/indy and symlink .indy_client folder for backwards compatibility with artifacts created on older indy-based images.
+# Create /home/indy and symlink .indy_client folder for backwards compatibility with artifacts created on older indy-based images
 RUN mkdir -p /home/indy
 RUN ln -s /home/aries/.indy_client /home/indy/.indy_client
 
@@ -99,7 +101,7 @@ RUN aries_cloudagent_package=$(find ./ -name "aries_cloudagent*.whl" | head -n 1
     rm aries_cloudagent*.whl && \
     chmod +rx $(python -m site --user-site) $HOME/.local
 
-# Clean-up unneccessary build dependencies and reduce final image size
+# Clean-up unneccessary build dependencies and reduce image size
 USER root
 RUN apt-get purge -y --auto-remove build-essential
 RUN dpkg -r --force-all apt apt-get && dpkg -r --force-all debconf dpkg
