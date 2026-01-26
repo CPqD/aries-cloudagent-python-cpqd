@@ -1,6 +1,6 @@
 """Basic in-memory storage implementation (non-wallet)."""
 
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 from ..core.in_memory import InMemoryProfile
 
@@ -105,8 +105,10 @@ class InMemoryStorage(BaseStorage, BaseStorageSearch):
     async def find_all_records(
         self,
         type_filter: str,
-        tag_query: Mapping = None,
-        options: Mapping = None,
+        tag_query: Optional[Mapping] = None,
+        order_by: Optional[str] = None,
+        descending: bool = False,
+        options: Optional[Mapping] = None,
     ):
         """Retrieve all records matching a particular type filter and tag query."""
         results = []
@@ -114,6 +116,37 @@ class InMemoryStorage(BaseStorage, BaseStorageSearch):
             if record.type == type_filter and tag_query_match(record.tags, tag_query):
                 results.append(record)
         return results
+
+    async def find_paginated_records(
+        self,
+        type_filter: str,
+        tag_query: Optional[Mapping] = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        offset: int = 0,
+        order_by: Optional[str] = None,
+        descending: bool = False,
+    ) -> Sequence[StorageRecord]:
+        """Retrieve a page of records matching a particular type filter and tag query.
+        
+        Args:
+            type_filter: The type of records to filter by
+            tag_query: An optional dictionary of tag filter clauses
+            limit: The maximum number of records to retrieve
+            offset: The offset to start retrieving records from
+            order_by: An optional field by which to order the records (not supported in InMemoryStorage)
+            descending: Whether to order the records in descending order (not supported in InMemoryStorage)
+            
+        Returns:
+            A sequence of StorageRecord matching the filter and query parameters
+        """
+        # Get all matching records
+        results = []
+        for record in self.profile.records.values():
+            if record.type == type_filter and tag_query_match(record.tags, tag_query):
+                results.append(record)
+        
+        # Apply pagination
+        return results[offset:offset + limit]
 
     async def delete_all_records(
         self,
