@@ -1,13 +1,13 @@
 """Abstract base classes for non-secrets storage."""
 
 from abc import ABC, abstractmethod
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
-from .error import StorageError, StorageDuplicateError, StorageNotFoundError
+from .error import StorageDuplicateError, StorageError, StorageNotFoundError
 from .record import StorageRecord
 
-
 DEFAULT_PAGE_SIZE = 100
+MAXIMUM_PAGE_SIZE = 10000
 
 
 def validate_record(record: StorageRecord, *, delete=False):
@@ -36,7 +36,7 @@ class BaseStorage(ABC):
 
     @abstractmethod
     async def get_record(
-        self, record_type: str, record_id: str, options: Mapping = None
+        self, record_type: str, record_id: str, options: Optional[Mapping] = None
     ) -> StorageRecord:
         """Fetch a record from the store by type and ID.
 
@@ -71,7 +71,10 @@ class BaseStorage(ABC):
         """
 
     async def find_record(
-        self, type_filter: str, tag_query: Mapping = None, options: Mapping = None
+        self,
+        type_filter: str,
+        tag_query: Optional[Mapping] = None,
+        options: Optional[Mapping] = None,
     ) -> StorageRecord:
         """Find a record using a unique tag filter.
 
@@ -90,21 +93,63 @@ class BaseStorage(ABC):
         return results[0]
 
     @abstractmethod
+    async def find_paginated_records(
+        self,
+        type_filter: str,
+        tag_query: Optional[Mapping] = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        offset: int = 0,
+        order_by: Optional[str] = None,
+        descending: bool = False,
+    ) -> Sequence[StorageRecord]:
+        """Retrieve a page of records matching a particular type filter and tag query.
+
+        Args:
+            type_filter: The type of records to filter by
+            tag_query: An optional dictionary of tag filter clauses
+            limit: The maximum number of records to retrieve
+            offset: The offset to start retrieving records from
+            order_by: An optional field by which to order the records.
+            descending: Whether to order the records in descending order.
+
+        Returns:
+            A sequence of StorageRecord matching the filter and query parameters.
+
+        """
+
+    @abstractmethod
     async def find_all_records(
         self,
         type_filter: str,
-        tag_query: Mapping = None,
-        options: Mapping = None,
-    ):
-        """Retrieve all records matching a particular type filter and tag query."""
+        tag_query: Optional[Mapping] = None,
+        order_by: Optional[str] = None,
+        descending: bool = False,
+        options: Optional[Mapping] = None,
+    ) -> Sequence[StorageRecord]:
+        """Retrieve all records matching a particular type filter and tag query.
+
+        Args:
+            type_filter: The type of records to filter by.
+            tag_query: An optional dictionary of tag filter clauses.
+            order_by: An optional field by which to order the records.
+            descending: Whether to order the records in descending order.
+            options: Additional options for the query.
+
+        """
 
     @abstractmethod
     async def delete_all_records(
         self,
         type_filter: str,
-        tag_query: Mapping = None,
-    ):
-        """Remove all records matching a particular type filter and tag query."""
+        tag_query: Optional[Mapping] = None,
+    ) -> None:
+        """Remove all records matching a particular type filter and tag query.
+
+        Args:
+            type_filter: The type of records to filter by.
+            tag_query: An optional dictionary of tag filter clauses.
+
+        """
 
 
 class BaseStorageSearch(ABC):
@@ -114,9 +159,9 @@ class BaseStorageSearch(ABC):
     def search_records(
         self,
         type_filter: str,
-        tag_query: Mapping = None,
-        page_size: int = None,
-        options: Mapping = None,
+        tag_query: Optional[Mapping] = None,
+        page_size: Optional[int] = None,
+        options: Optional[Mapping] = None,
     ) -> "BaseStorageSearchSession":
         """Create a new record query.
 
@@ -140,7 +185,7 @@ class BaseStorageSearchSession(ABC):
     """Abstract stored records search session interface."""
 
     @abstractmethod
-    async def fetch(self, max_count: int = None) -> Sequence[StorageRecord]:
+    async def fetch(self, max_count: Optional[int] = None) -> Sequence[StorageRecord]:
         """Fetch the next list of results from the store.
 
         Args:
@@ -167,7 +212,7 @@ class BaseStorageSearchSession(ABC):
 class IterSearch:
     """A generic record search async iterator."""
 
-    def __init__(self, search: BaseStorageSearchSession, page_size: int = None):
+    def __init__(self, search: BaseStorageSearchSession, page_size: Optional[int] = None):
         """Instantiate a new `IterSearch` instance."""
         self._buffer = None
         self._page_size = page_size
