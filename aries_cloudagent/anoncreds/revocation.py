@@ -747,64 +747,88 @@ class AnonCredsRevocation:
 
     async def handle_full_registry(self, rev_reg_def_id: str):
         """Update the registry status and start the next registry generation."""
-        async with self.profile.session() as session:
-            active_rev_reg_def = await session.handle.fetch(
-                CATEGORY_REV_REG_DEF, rev_reg_def_id
+        async with self.profile.transaction() as txn:
+            active_rev_reg_def = await txn.handle.fetch(
+                CATEGORY_REV_REG_DEF, rev_reg_def_id, for_update=True
             )
-            if active_rev_reg_def:
-                # ok, we have an active rev reg.
-                # find the backup/fallover rev reg (finished and not active)
-                rev_reg_defs = await session.handle.fetch_all(
-                    CATEGORY_REV_REG_DEF,
-                    {
-                        "active": json.dumps(False),
-                        "cred_def_id": active_rev_reg_def.value_json["credDefId"],
-                        "state": RevRegDefState.STATE_FINISHED,
-                    },
-                    limit=1,
-                )
-                if len(rev_reg_defs):
-                    backup_rev_reg_def_id = rev_reg_defs[0].name
-                else:
-                    # attempted to create and register here but fails in practical usage.
-                    # the indexes and list do not get set properly (timing issue?)
-                    # if max cred num = 4 for instance, will get
-                    # Revocation status list does not have the index 4
-                    # in _create_credential calling Credential.create
-                    raise AnonCredsRevocationError(
-                        "Error handling full registry. No backup registry available."
+            if not active_rev_reg_def:
+                return
+
+            if active_rev_reg_def.tags.get("state") == RevRegDefState.STATE_FULL:
+                LOGGER.info("Registry %s already marked as full by another instance, skipping rotation", rev_reg_def_id)
+                return
+
+            cred_def_id = active_rev_reg_def.value_json["credDefId"]
+            
+            # Find backup
+            rev_reg_defs = await txn.handle.fetch_all(
+                CATEGORY_REV_REG_DEF,
+                {
+                    "active": json.dumps(False),
+                    "cred_def_id": cred_def_id,
+                    "state": RevRegDefState.STATE_FINISHED,
+                },
+                limit=1,
+                for_update=True,
+            )
+            
+            if not rev_reg_defs:
+                raise AnonCredsRevocationError("Error handling full registry. No backup registry available.")
+                
+            backup_rev_reg_def_id = rev_reg_defs[0].name
+            
+            # Mark active as FULL and False
+            tags = active_rev_reg_def.tags
+            tags["state"] = RevRegDefState.STATE_FULL
+            tags["active"] = json.dumps(False)
+            await txn.handle.replace(
+                CATEGORY_REV_REG_DEF,
+                active_rev_reg_def.name,
+                active_rev_reg_def.value,
+                tags,
+            )
+            
+            # Mark backup as active
+            backup_entry = rev_reg_defs[0]
+            backup_tags = backup_entry.tags
+            backup_tags["active"] = json.dumps(True)
+            await txn.handle.replace(
+                CATEGORY_REV_REG_DEF,
+                backup_entry.name,
+                backup_entry.value,
+                backup_tags,
+            )
+            
+            # Extract info for creating next backup
+            issuer_id = active_rev_reg_def.value_json["issuerId"]
+            registry_type = active_rev_reg_def.value_json["revocDefType"]
+            max_cred_num = active_rev_reg_def.value_json["value"]["maxCredNum"]
+            
+            await txn.commit()
+            
+        LOGGER.info(f"Rotated registry: previous={rev_reg_def_id}, current={backup_rev_reg_def_id}")
+            
+        # Launch background task to create new backup
+        # We do NOT await it here to avoid blocking the HTTP response and causing a timeout
+        async def _create_backup_with_retry():
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    await self.create_and_register_revocation_registry_definition(
+                        issuer_id=issuer_id,
+                        cred_def_id=cred_def_id,
+                        registry_type=registry_type,
+                        tag=str(uuid4()),
+                        max_cred_num=max_cred_num,
                     )
-
-        # set the backup to active...
-        if backup_rev_reg_def_id:
-            await self.set_active_registry(backup_rev_reg_def_id)
-
-            async with self.profile.transaction() as txn:
-                # re-fetch the old active (it's been updated), we need to mark as full
-                active_rev_reg_def = await txn.handle.fetch(
-                    CATEGORY_REV_REG_DEF, rev_reg_def_id, for_update=True
-                )
-                tags = active_rev_reg_def.tags
-                tags["state"] = RevRegDefState.STATE_FULL
-                await txn.handle.replace(
-                    CATEGORY_REV_REG_DEF,
-                    active_rev_reg_def.name,
-                    active_rev_reg_def.value,
-                    tags,
-                )
-                await txn.commit()
-
-            # create our next fallover/backup
-            backup_reg = await self.create_and_register_revocation_registry_definition(
-                issuer_id=active_rev_reg_def.value_json["issuerId"],
-                cred_def_id=active_rev_reg_def.value_json["credDefId"],
-                registry_type=active_rev_reg_def.value_json["revocDefType"],
-                tag=str(uuid4()),
-                max_cred_num=active_rev_reg_def.value_json["value"]["maxCredNum"],
-            )
-            LOGGER.info(f"previous rev_reg_def_id = {rev_reg_def_id}")
-            LOGGER.info(f"current rev_reg_def_id = {backup_rev_reg_def_id}")
-            LOGGER.info(f"backup reg = {backup_reg}")
+                    LOGGER.info("Successfully created new backup registry in background.")
+                    return
+                except Exception as e:
+                    LOGGER.error("Failed to create backup registry in background (attempt %d/%d): %s", attempt, max_attempts, e)
+                    if attempt < max_attempts:
+                        await asyncio.sleep(10)
+                        
+        task = asyncio.create_task(_create_backup_with_retry())
 
     async def decommission_registry(self, cred_def_id: str):
         """Decommission post-init registries and start the next registry generation."""
@@ -905,6 +929,7 @@ class AnonCredsRevocation:
         credential_values: dict,
         rev_reg_def_id: Optional[str] = None,
         tails_file_path: Optional[str] = None,
+        preallocated_rev_reg_index: Optional[int] = None,
     ) -> Tuple[str, str]:
         try:
             async with self.profile.session() as session:
@@ -939,53 +964,68 @@ class AnonCredsRevocation:
 
         if rev_reg_def_id and tails_file_path:
             try:
-                async with self.profile.transaction() as txn:
-                    rev_list = await txn.handle.fetch(CATEGORY_REV_LIST, rev_reg_def_id)
-                    rev_reg_def = await txn.handle.fetch(
-                        CATEGORY_REV_REG_DEF, rev_reg_def_id
-                    )
-                    rev_key = await txn.handle.fetch(
-                        CATEGORY_REV_REG_DEF_PRIVATE, rev_reg_def_id
-                    )
-                    if not rev_list:
-                        raise AnonCredsRevocationError("Revocation registry not found")
-                    if not rev_reg_def:
-                        raise AnonCredsRevocationError(
-                            "Revocation registry definition not found"
+                # If an index was already pre-allocated by the caller (using a distributed lock), 
+                # we don't need a transaction to increment it here. We just fetch the current state.
+                if preallocated_rev_reg_index is not None:
+                    async with self.profile.session() as session:
+                        rev_list = await session.handle.fetch(CATEGORY_REV_LIST, rev_reg_def_id)
+                        rev_reg_def = await session.handle.fetch(CATEGORY_REV_REG_DEF, rev_reg_def_id)
+                        rev_key = await session.handle.fetch(CATEGORY_REV_REG_DEF_PRIVATE, rev_reg_def_id)
+                        
+                        if not rev_list or not rev_reg_def or not rev_key:
+                            raise AnonCredsRevocationError("Revocation registry components not found")
+                        
+                        try:
+                            rev_reg_def = RevocationRegistryDefinition.load(rev_reg_def.raw_value)
+                            rev_list = RevocationStatusList.load(rev_list.value_json["rev_list"])
+                        except AnoncredsError as err:
+                            raise AnonCredsRevocationError("Error loading revocation registry definition") from err
+                        
+                        rev_reg_index = preallocated_rev_reg_index
+                else:
+                    # Fallback for backwards compatibility (e.g. tests)
+                    async with self.profile.transaction() as txn:
+                        rev_list = await txn.handle.fetch(CATEGORY_REV_LIST, rev_reg_def_id, for_update=True)
+                        rev_reg_def = await txn.handle.fetch(
+                            CATEGORY_REV_REG_DEF, rev_reg_def_id
                         )
-                    if not rev_key:
-                        raise AnonCredsRevocationError(
-                            "Revocation registry definition private data not found"
+                        rev_key = await txn.handle.fetch(
+                            CATEGORY_REV_REG_DEF_PRIVATE, rev_reg_def_id
                         )
-                    # NOTE: we increment the index ahead of time to keep the
-                    # transaction short. The revocation registry itself will NOT
-                    # be updated because we always use ISSUANCE_BY_DEFAULT.
-                    # If something goes wrong later, the index will be skipped.
-                    # FIXME - double check issuance type in case of upgraded wallet?
-                    rev_info = rev_list.value_json
-                    rev_info_tags = rev_list.tags
-                    rev_reg_index = rev_info["next_index"]
-                    try:
-                        rev_reg_def = RevocationRegistryDefinition.load(
-                            rev_reg_def.raw_value
+                        if not rev_list:
+                            raise AnonCredsRevocationError("Revocation registry not found")
+                        if not rev_reg_def:
+                            raise AnonCredsRevocationError(
+                                "Revocation registry definition not found"
+                            )
+                        if not rev_key:
+                            raise AnonCredsRevocationError(
+                                "Revocation registry definition private data not found"
+                            )
+                        rev_info = rev_list.value_json
+                        rev_info_tags = rev_list.tags
+                        rev_reg_index = rev_info["next_index"]
+                        try:
+                            rev_reg_def = RevocationRegistryDefinition.load(
+                                rev_reg_def.raw_value
+                            )
+                            rev_list = RevocationStatusList.load(rev_info["rev_list"])
+                        except AnoncredsError as err:
+                            raise AnonCredsRevocationError(
+                                "Error loading revocation registry definition"
+                            ) from err
+                        if rev_reg_index > rev_reg_def.max_cred_num:
+                            raise AnonCredsRevocationRegistryFullError(
+                                "Revocation registry is full"
+                            )
+                        rev_info["next_index"] = rev_reg_index + 1
+                        await txn.handle.replace(
+                            CATEGORY_REV_LIST,
+                            rev_reg_def_id,
+                            value_json=rev_info,
+                            tags=rev_info_tags,
                         )
-                        rev_list = RevocationStatusList.load(rev_info["rev_list"])
-                    except AnoncredsError as err:
-                        raise AnonCredsRevocationError(
-                            "Error loading revocation registry definition"
-                        ) from err
-                    if rev_reg_index > rev_reg_def.max_cred_num:
-                        raise AnonCredsRevocationRegistryFullError(
-                            "Revocation registry is full"
-                        )
-                    rev_info["next_index"] = rev_reg_index + 1
-                    await txn.handle.replace(
-                        CATEGORY_REV_LIST,
-                        rev_reg_def_id,
-                        value_json=rev_info,
-                        tags=rev_info_tags,
-                    )
-                    await txn.commit()
+                        await txn.commit()
             except AskarError as err:
                 raise AnonCredsRevocationError(
                     "Error updating revocation registry index"
@@ -1022,6 +1062,78 @@ class AnonCredsRevocation:
             raise AnonCredsRevocationError("Error creating credential") from err
 
         return credential.to_json(), credential_revocation_id
+
+    async def _get_and_reserve_revocation_index(
+        self, cred_def_id: str
+    ) -> Tuple[bool, Optional[str], Optional[str], Optional[int]]:
+        """Atomically find active registry and reserve an index.
+        
+        Returns:
+            (success, rev_reg_def_id, tails_file_path, rev_reg_index)
+        """
+        async with self.profile.transaction() as txn:
+            lock_key = f"lock_issue_{cred_def_id}"
+            try:
+                # Try to insert lock record if not exists
+                lock_entry = await txn.handle.fetch("CATEGORY_REV_REG_DEF_LOCK", lock_key, for_update=True)
+                if not lock_entry:
+                    await txn.handle.insert("CATEGORY_REV_REG_DEF_LOCK", lock_key, value_json={"locked": True})
+                    lock_entry = await txn.handle.fetch("CATEGORY_REV_REG_DEF_LOCK", lock_key, for_update=True)
+            except AskarError:
+                lock_entry = await txn.handle.fetch("CATEGORY_REV_REG_DEF_LOCK", lock_key, for_update=True)
+
+            rev_reg_defs = await txn.handle.fetch_all(
+                CATEGORY_REV_REG_DEF,
+                {
+                    "cred_def_id": cred_def_id,
+                    "active": json.dumps(True),
+                },
+                limit=1,
+            )
+
+            if not rev_reg_defs:
+                raise AnonCredsRevocationError("No active registry")
+            
+            entry = rev_reg_defs[0]
+            rev_reg_def_id = entry.name
+            
+            try:
+                rev_reg_def = RevRegDef.deserialize(entry.value_json)
+                anoncreds_rev_reg_def = RevocationRegistryDefinition.load(entry.raw_value)
+            except AnoncredsError as err:
+                raise AnonCredsRevocationError("Error loading revocation registry definition") from err
+                
+            if entry.tags.get("state") != RevRegDefState.STATE_FINISHED:
+                LOGGER.info("Active registry %s is not yet FINISHED, waiting...", rev_reg_def_id)
+                return False, None, None, None
+
+            # Reserve index
+            rev_list_entry = await txn.handle.fetch(CATEGORY_REV_LIST, rev_reg_def_id)
+            if not rev_list_entry:
+                LOGGER.info("Revocation registry list not found for %s yet, waiting for event listener to create it...", rev_reg_def_id)
+                return False, None, None, None
+            
+            rev_info = rev_list_entry.value_json
+            rev_info_tags = rev_list_entry.tags
+            rev_reg_index = rev_info["next_index"]
+            
+            if rev_reg_index >= anoncreds_rev_reg_def.max_cred_num:
+                # It is genuinely full. Return the ID so create_credential triggers rotation.
+                return False, rev_reg_def_id, None, None
+            
+            # Increment and save
+            rev_info["next_index"] = rev_reg_index + 1
+            await txn.handle.replace(
+                CATEGORY_REV_LIST,
+                rev_reg_def_id,
+                value_json=rev_info,
+                tags=rev_info_tags,
+            )
+            
+            await txn.commit()
+            
+            tails_file_path = self.get_local_tails_path(rev_reg_def)
+            return True, rev_reg_def_id, tails_file_path, rev_reg_index
 
     async def create_credential(
         self,
@@ -1060,23 +1172,25 @@ class AnonCredsRevocation:
                 )
                 await asyncio.sleep(2)
 
-            rev_reg_def_result = None
             if revocable:
-                rev_reg_def_result = await self.get_or_create_active_registry(
-                    cred_def_id
-                )
-                if (
-                    rev_reg_def_result.revocation_registry_definition_state.state
-                    != STATE_FINISHED
-                ):
+                success, rev_reg_def_id, tails_file_path, rev_reg_index = await self._get_and_reserve_revocation_index(cred_def_id)
+                if not success:
+                    # Registry is full or not finished
+                    if rev_reg_def_id:
+                        LOGGER.info("Registry %s is full or not ready, calling handle_full_registry", rev_reg_def_id)
+                        try:
+                            await self.handle_full_registry(rev_reg_def_id)
+                        except AnonCredsRevocationError as rot_err:
+                            LOGGER.warning(
+                                "Failed to rotate full registry %s: %s",
+                                rev_reg_def_id,
+                                rot_err,
+                            )
                     continue
-                rev_reg_def_id = rev_reg_def_result.rev_reg_def_id
-                tails_file_path = self.get_local_tails_path(
-                    rev_reg_def_result.rev_reg_def
-                )
             else:
                 rev_reg_def_id = None
                 tails_file_path = None
+                rev_reg_index = None
 
             try:
                 cred_json, cred_rev_id = await self._create_credential(
@@ -1087,20 +1201,11 @@ class AnonCredsRevocation:
                     credential_values,
                     rev_reg_def_id,
                     tails_file_path,
+                    rev_reg_index,
                 )
             except AnonCredsRevocationRegistryFullError:
-                # unlucky, another instance filled the registry first
+                # Fallback just in case (should not happen with preallocation)
                 continue
-
-            # cred rev id is zero based
-            # max cred num is one based
-            # however, if we wait until max cred num is reached, we are too late.
-            if rev_reg_def_result:
-                if (
-                    rev_reg_def_result.rev_reg_def.value.max_cred_num
-                    <= int(cred_rev_id) + 1
-                ):
-                    await self.handle_full_registry(rev_reg_def_id)
 
             return cred_json, cred_rev_id, rev_reg_def_id
 
