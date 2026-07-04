@@ -881,37 +881,68 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
             await self.revocation.upload_tails_file(rev_reg_def)
 
     @mock.patch.object(InMemoryProfileSession, "handle")
-    @mock.patch.object(
-        test_module.AnonCredsRevocation, "set_active_registry", return_value=None
-    )
+
     @mock.patch.object(
         test_module.AnonCredsRevocation,
         "create_and_register_revocation_registry_definition",
         return_value="backup",
     )
-    async def test_handle_full_registry(
-        self, mock_create_and_register, mock_set_active_registry, mock_handle
-    ):
-        mock_handle.fetch = mock.CoroutineMock(return_value=MockRevRegDefEntry())
-        mock_handle.fetch_all = mock.CoroutineMock(
-            return_value=[
-                MockRevRegDefEntry(),
-                MockRevRegDefEntry(),
-            ]
-        )
-        mock_handle.replace = mock.CoroutineMock(return_value=None)
+    async def test_handle_full_registry(self, mock_create_and_register, mock_handle):
+        def active_entry(state=RevRegDefState.STATE_ACTION):
+            return MockEntry(
+                name="active-rev-reg-def-id",
+                tags={"state": state, "active": json.dumps(True)},
+                value_json={
+                    "credDefId": "test-cred-def-id",
+                    "issuerId": "test-issuer-id",
+                    "revocDefType": "CL_ACCUM",
+                    "value": {"maxCredNum": 100},
+                },
+            )
 
+        def backup_entry():
+            return MockEntry(
+                name="backup-rev-reg-def-id",
+                tags={
+                    "state": RevRegDefState.STATE_FINISHED,
+                    "active": json.dumps(False),
+                },
+                value_json={},
+            )
+
+        # active registry not found: nothing to rotate, no exception
+        mock_handle.fetch = mock.CoroutineMock(return_value=None)
         await self.revocation.handle_full_registry("test-rev-reg-def-id")
-        assert mock_create_and_register.called
-        assert mock_set_active_registry.called
-        assert mock_handle.fetch.call_count == 2
-        assert mock_handle.fetch_all.called
-        assert mock_handle.replace.called
 
-        # no backup registry available
+        # active registry already marked full by another instance: no-op
+        mock_handle.fetch = mock.CoroutineMock(
+            return_value=active_entry(state=RevRegDefState.STATE_FULL)
+        )
+        mock_handle.fetch_all = mock.CoroutineMock()
+        await self.revocation.handle_full_registry("test-rev-reg-def-id")
+        assert not mock_handle.fetch_all.called
+
+        # no backup registry available: raises and rolls back, nothing scheduled
+        mock_handle.fetch = mock.CoroutineMock(return_value=active_entry())
         mock_handle.fetch_all = mock.CoroutineMock(return_value=[])
         with self.assertRaises(test_module.AnonCredsRevocationError):
             await self.revocation.handle_full_registry("test-rev-reg-def-id")
+        assert not self.revocation._background_tasks
+
+        # happy path: swap active <-> backup atomically, then schedule
+        # background creation of the next backup registry
+        mock_handle.fetch = mock.CoroutineMock(return_value=active_entry())
+        mock_handle.fetch_all = mock.CoroutineMock(return_value=[backup_entry()])
+        mock_handle.replace = mock.CoroutineMock(return_value=None)
+
+        await self.revocation.handle_full_registry("test-rev-reg-def-id")
+
+        assert mock_handle.replace.call_count == 2
+        assert self.revocation._background_tasks
+        for task in list(self.revocation._background_tasks):
+            await task
+        assert mock_create_and_register.called
+        assert not self.revocation._background_tasks
 
     @mock.patch.object(InMemoryProfileSession, "handle")
     async def test_decommission_registry(self, mock_handle):
@@ -1146,6 +1177,110 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
         with self.assertRaises(test_module.AnonCredsRevocationError):
             await call_test_func()
 
+    @mock.patch.object(InMemoryProfileSession, "handle")
+    @mock.patch.object(
+        RevocationRegistryDefinition, "load", return_value=rev_reg_def.value
+    )
+    async def test_get_and_reserve_revocation_index(
+        self, mock_load_rev_reg_def, mock_handle
+    ):
+        lock_row = MockEntry(
+            name="lock_issue_test-cred-def-id", value_json={"locked": True}
+        )
+
+        def active_reg_entry(state=RevRegDefState.STATE_FINISHED):
+            return MockEntry(
+                name="test-rev-reg-def-id",
+                tags={"state": state, "active": json.dumps(True)},
+                value_json=rev_reg_def.to_json(),
+            )
+
+        # no active registry -> hard failure, nothing to retry towards
+        mock_handle.fetch = mock.CoroutineMock(return_value=lock_row)
+        mock_handle.fetch_all = mock.CoroutineMock(return_value=[])
+        with self.assertRaises(test_module.AnonCredsRevocationError):
+            await self.revocation._get_and_reserve_revocation_index(
+                "test-cred-def-id"
+            )
+
+        # active registry not yet FINISHED -> soft failure (caller retries)
+        mock_handle.fetch = mock.CoroutineMock(return_value=lock_row)
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_reg_entry(state=RevRegDefState.STATE_ACTION)]
+        )
+        result = await self.revocation._get_and_reserve_revocation_index(
+            "test-cred-def-id"
+        )
+        assert result == (False, None, None, None)
+
+        # revocation list not created yet -> soft failure (caller retries)
+        mock_handle.fetch = mock.CoroutineMock(side_effect=[lock_row, None])
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_reg_entry()]
+        )
+        result = await self.revocation._get_and_reserve_revocation_index(
+            "test-cred-def-id"
+        )
+        assert result == (False, None, None, None)
+
+        # registry genuinely full -> id is returned so caller can rotate it
+        mock_handle.fetch = mock.CoroutineMock(
+            side_effect=[lock_row, MockEntry(value_json={"next_index": 100})]
+        )
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_reg_entry()]
+        )
+        result = await self.revocation._get_and_reserve_revocation_index(
+            "test-cred-def-id"
+        )
+        assert result == (False, "test-rev-reg-def-id", None, None)
+
+        # index reserved successfully
+        mock_handle.fetch = mock.CoroutineMock(
+            side_effect=[lock_row, MockEntry(value_json={"next_index": 5})]
+        )
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_reg_entry()]
+        )
+        mock_handle.replace = mock.CoroutineMock(return_value=None)
+        success, rev_reg_def_id, tails_file_path, rev_reg_index = (
+            await self.revocation._get_and_reserve_revocation_index(
+                "test-cred-def-id"
+            )
+        )
+        assert success is True
+        assert rev_reg_def_id == "test-rev-reg-def-id"
+        assert rev_reg_index == 5
+        assert tails_file_path is not None
+        assert mock_handle.replace.called
+
+        # lock insert races with another instance (duplicate key): recovers
+        # by re-fetching the row instead of failing the whole operation
+        mock_handle.fetch = mock.CoroutineMock(
+            side_effect=[None, lock_row, MockEntry(value_json={"next_index": 5})]
+        )
+        mock_handle.insert = mock.CoroutineMock(
+            side_effect=AskarError(code=AskarErrorCode.DUPLICATE, message="dup")
+        )
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_reg_entry()]
+        )
+        mock_handle.replace = mock.CoroutineMock(return_value=None)
+        success, *_ = await self.revocation._get_and_reserve_revocation_index(
+            "test-cred-def-id"
+        )
+        assert success is True
+
+        # a genuine Askar failure acquiring the lock must not be swallowed
+        mock_handle.fetch = mock.CoroutineMock(return_value=None)
+        mock_handle.insert = mock.CoroutineMock(
+            side_effect=AskarError(code=AskarErrorCode.UNEXPECTED, message="boom")
+        )
+        with self.assertRaises(test_module.AnonCredsRevocationError):
+            await self.revocation._get_and_reserve_revocation_index(
+                "test-cred-def-id"
+            )
+
     @mock.patch.object(
         AnonCredsIssuer, "cred_def_supports_revocation", return_value=True
     )
@@ -1167,17 +1302,8 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
                 )
             )
         )
-        self.revocation.get_or_create_active_registry = mock.CoroutineMock(
-            return_value=RevRegDefResult(
-                job_id="test-job-id",
-                revocation_registry_definition_state=RevRegDefState(
-                    state=RevRegDefState.STATE_FINISHED,
-                    revocation_registry_definition_id="active-reg-reg",
-                    revocation_registry_definition=rev_reg_def,
-                ),
-                registration_metadata={},
-                revocation_registry_definition_metadata={},
-            )
+        self.revocation._get_and_reserve_revocation_index = mock.CoroutineMock(
+            return_value=(True, "active-reg-reg", "tails-file-path", 98)
         )
 
         # Test private funtion seperately - very large
@@ -1196,8 +1322,60 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
             credential_values={},
         )
 
-        assert isinstance(result, tuple)
+        assert result == ({"cred": "cred"}, 98, "active-reg-reg")
         assert mock_supports_revocation.call_count == 1
+
+    @mock.patch.object(test_module.asyncio, "sleep", return_value=None)
+    @mock.patch.object(
+        AnonCredsIssuer, "cred_def_supports_revocation", return_value=True
+    )
+    async def test_create_credential_rotates_full_registry_then_succeeds(
+        self, mock_supports_revocation, mock_sleep
+    ):
+        self.profile.inject = mock.Mock(
+            return_value=mock.MagicMock(
+                get_schema=mock.CoroutineMock(
+                    return_value=GetSchemaResult(
+                        schema_id="CsQY9MGeD3CQP4EyuVFo5m:2:MYCO Biomarker:0.0.3",
+                        schema=AnonCredsSchema(
+                            issuer_id="CsQY9MGeD3CQP4EyuVFo5m",
+                            name="MYCO Biomarker:0.0.3",
+                            version="1.0",
+                            attr_names=["attr1", "attr2"],
+                        ),
+                        schema_metadata={},
+                        resolution_metadata={},
+                    )
+                )
+            )
+        )
+        # First attempt finds the registry full and triggers a rotation.
+        # Second attempt reserves an index in the newly-activated backup.
+        self.revocation._get_and_reserve_revocation_index = mock.CoroutineMock(
+            side_effect=[
+                (False, "full-reg-reg", None, None),
+                (True, "active-reg-reg", "tails-file-path", 0),
+            ]
+        )
+        self.revocation.handle_full_registry = mock.CoroutineMock(return_value=None)
+        self.revocation._create_credential = mock.CoroutineMock(
+            return_value=({"cred": "cred"}, 0)
+        )
+
+        result = await self.revocation.create_credential(
+            credential_offer={
+                "schema_id": "CsQY9MGeD3CQP4EyuVFo5m:2:MYCO Biomarker:0.0.3",
+                "cred_def_id": "CsQY9MGeD3CQP4EyuVFo5m:3:CL:14951:MYCO_Biomarker",
+                "key_correctness_proof": {},
+                "nonce": "nonce",
+            },
+            credential_request={},
+            credential_values={},
+        )
+
+        assert result == ({"cred": "cred"}, 0, "active-reg-reg")
+        self.revocation.handle_full_registry.assert_called_once_with("full-reg-reg")
+        assert self.revocation._get_and_reserve_revocation_index.call_count == 2
 
     @mock.patch.object(InMemoryProfileSession, "handle")
     @mock.patch.object(RevList, "to_native")

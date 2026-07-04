@@ -21,7 +21,7 @@ from anoncreds import (
     RevocationRegistryDefinitionPrivate,
     RevocationStatusList,
 )
-from aries_askar.error import AskarError
+from aries_askar.error import AskarError, AskarErrorCode
 from requests import RequestException, Session
 
 from aries_cloudagent.anoncreds.models.anoncreds_cred_def import CredDef
@@ -58,6 +58,7 @@ CATEGORY_REV_LIST = "revocation_list"
 CATEGORY_REV_REG_DEF = "revocation_reg_def"
 CATEGORY_REV_REG_DEF_PRIVATE = "revocation_reg_def_private"
 CATEGORY_REV_REG_ISSUER = "revocation_reg_def_issuer"
+CATEGORY_REV_REG_DEF_LOCK = "revocation_reg_def_lock"
 STATE_REVOCATION_POSTED = "posted"
 STATE_REVOCATION_PENDING = "pending"
 REV_REG_DEF_STATE_ACTIVE = "active"
@@ -91,6 +92,7 @@ class AnonCredsRevocation:
 
         """
         self._profile = profile
+        self._background_tasks: set = set()
 
     @property
     def profile(self) -> AskarAnoncredsProfile:
@@ -829,6 +831,8 @@ class AnonCredsRevocation:
                         await asyncio.sleep(10)
                         
         task = asyncio.create_task(_create_backup_with_retry())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def decommission_registry(self, cred_def_id: str):
         """Decommission post-init registries and start the next registry generation."""
@@ -1075,12 +1079,31 @@ class AnonCredsRevocation:
             lock_key = f"lock_issue_{cred_def_id}"
             try:
                 # Try to insert lock record if not exists
-                lock_entry = await txn.handle.fetch("CATEGORY_REV_REG_DEF_LOCK", lock_key, for_update=True)
+                lock_entry = await txn.handle.fetch(
+                    CATEGORY_REV_REG_DEF_LOCK, lock_key, for_update=True
+                )
                 if not lock_entry:
-                    await txn.handle.insert("CATEGORY_REV_REG_DEF_LOCK", lock_key, value_json={"locked": True})
-                    lock_entry = await txn.handle.fetch("CATEGORY_REV_REG_DEF_LOCK", lock_key, for_update=True)
-            except AskarError:
-                lock_entry = await txn.handle.fetch("CATEGORY_REV_REG_DEF_LOCK", lock_key, for_update=True)
+                    await txn.handle.insert(
+                        CATEGORY_REV_REG_DEF_LOCK, lock_key, value_json={"locked": True}
+                    )
+                    lock_entry = await txn.handle.fetch(
+                        CATEGORY_REV_REG_DEF_LOCK, lock_key, for_update=True
+                    )
+            except AskarError as err:
+                # A concurrent transaction may have inserted the lock record first;
+                # that's expected and we just need to wait for its row lock below.
+                # Any other Askar error is a real failure and must not be swallowed,
+                # since silently continuing here would mean proceeding without a lock.
+                if err.code != AskarErrorCode.DUPLICATE:
+                    raise AnonCredsRevocationError(
+                        "Error acquiring issuance lock"
+                    ) from err
+                lock_entry = await txn.handle.fetch(
+                    CATEGORY_REV_REG_DEF_LOCK, lock_key, for_update=True
+                )
+
+            if not lock_entry:
+                raise AnonCredsRevocationError("Error acquiring issuance lock")
 
             rev_reg_defs = await txn.handle.fetch_all(
                 CATEGORY_REV_REG_DEF,
