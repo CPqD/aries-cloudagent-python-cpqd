@@ -21,7 +21,7 @@ from anoncreds import (
     RevocationRegistryDefinitionPrivate,
     RevocationStatusList,
 )
-from aries_askar.error import AskarError, AskarErrorCode
+from aries_askar.error import AskarError
 from requests import RequestException, Session
 
 from aries_cloudagent.anoncreds.models.anoncreds_cred_def import CredDef
@@ -58,7 +58,6 @@ CATEGORY_REV_LIST = "revocation_list"
 CATEGORY_REV_REG_DEF = "revocation_reg_def"
 CATEGORY_REV_REG_DEF_PRIVATE = "revocation_reg_def_private"
 CATEGORY_REV_REG_ISSUER = "revocation_reg_def_issuer"
-CATEGORY_REV_REG_DEF_LOCK = "revocation_reg_def_lock"
 STATE_REVOCATION_POSTED = "posted"
 STATE_REVOCATION_PENDING = "pending"
 REV_REG_DEF_STATE_ACTIVE = "active"
@@ -81,6 +80,43 @@ class RevokeResult(NamedTuple):
     failed: Optional[Sequence[str]] = None
 
 
+class _RevocationRuntimeState:
+    """In-memory coordination state, shared by profile rather than per call.
+
+    AnonCredsRevocation is constructed fresh on every credential issuance
+    (see e.g. protocols/issue_credential/v2_0/formats/anoncreds/handler.py,
+    which does `AnonCredsRevocation(self.profile)` inline each time). Locks,
+    semaphores, and background-task references only do their job if the
+    same object is reused across those calls -- storing them on `self`
+    means every call gets its own private, uncontended copy, silently
+    defeating the serialization/backoff they're there for. This holds that
+    state instead, bound once per profile via the profile's own injector
+    (see AnonCredsRevocation._runtime_state), so every AnonCredsRevocation
+    instance for the same wallet shares it.
+    """
+
+    def __init__(self):
+        """Initialize a _RevocationRuntimeState instance."""
+        # In-process mutex per cred_def_id serializing revocation index
+        # reservation. Waiters queue in memory instead of holding a Postgres
+        # connection/row lock, which is what exhausted the shared multitenant
+        # pool under concurrent issuance for the same cred_def_id.
+        self.issuance_locks: dict = {}
+        # Bounds how many background backup-registry creations (ledger
+        # writes) can be in flight at once across all cred_def_ids, so a
+        # burst of rotations can't fire an unbounded number of concurrent
+        # Besu transactions.
+        self.registry_creation_semaphore = asyncio.Semaphore(2)
+        # cred_def_ids with a backup-registry creation currently in flight,
+        # so a burst of rotation attempts for the same cred_def_id doesn't
+        # launch redundant concurrent ledger writes.
+        self.pending_backup_creations: set = set()
+        # Strong references to in-flight background tasks. Without this,
+        # nothing keeps them alive (asyncio only holds a weak reference),
+        # and they can be garbage-collected mid-retry.
+        self.background_tasks: set = set()
+
+
 class AnonCredsRevocation:
     """Revocation registry operations manager."""
 
@@ -92,7 +128,6 @@ class AnonCredsRevocation:
 
         """
         self._profile = profile
-        self._background_tasks: set = set()
 
     @property
     def profile(self) -> AskarAnoncredsProfile:
@@ -101,6 +136,29 @@ class AnonCredsRevocation:
             raise ValueError(ANONCREDS_PROFILE_REQUIRED_MSG)
 
         return self._profile
+
+    def _runtime_state(self) -> _RevocationRuntimeState:
+        """Return the coordination state shared by every AnonCredsRevocation.
+
+        Creates and binds it on the profile on first use.
+        """
+        state = self.profile.inject_or(_RevocationRuntimeState)
+        if state is None:
+            state = _RevocationRuntimeState()
+            self.profile.context.injector.bind_instance(_RevocationRuntimeState, state)
+        return state
+
+    @property
+    def _background_tasks(self) -> set:
+        return self._runtime_state().background_tasks
+
+    @property
+    def _pending_backup_creations(self) -> set:
+        return self._runtime_state().pending_backup_creations
+
+    @property
+    def _registry_creation_semaphore(self) -> asyncio.Semaphore:
+        return self._runtime_state().registry_creation_semaphore
 
     async def notify(self, event: Event):
         """Emit an event on the event bus."""
@@ -757,11 +815,18 @@ class AnonCredsRevocation:
                 return
 
             if active_rev_reg_def.tags.get("state") == RevRegDefState.STATE_FULL:
-                LOGGER.info("Registry %s already marked as full by another instance, skipping rotation", rev_reg_def_id)
+                LOGGER.info(
+                    "Registry %s already marked as full by another instance, "
+                    "skipping rotation",
+                    rev_reg_def_id,
+                )
                 return
 
             cred_def_id = active_rev_reg_def.value_json["credDefId"]
-            
+            issuer_id = active_rev_reg_def.value_json["issuerId"]
+            registry_type = active_rev_reg_def.value_json["revocDefType"]
+            max_cred_num = active_rev_reg_def.value_json["value"]["maxCredNum"]
+
             # Find backup
             rev_reg_defs = await txn.handle.fetch_all(
                 CATEGORY_REV_REG_DEF,
@@ -773,12 +838,21 @@ class AnonCredsRevocation:
                 limit=1,
                 for_update=True,
             )
-            
+
             if not rev_reg_defs:
-                raise AnonCredsRevocationError("Error handling full registry. No backup registry available.")
-                
+                # Nothing to rotate into right now. Make sure a new registry
+                # is being created so a *future* request has something to
+                # rotate into, instead of leaving this cred def permanently
+                # stuck until a human runs the manual /rotate endpoint.
+                self._ensure_backup_creation_started(
+                    issuer_id, cred_def_id, registry_type, max_cred_num
+                )
+                raise AnonCredsRevocationError(
+                    "Error handling full registry. No backup registry available."
+                )
+
             backup_rev_reg_def_id = rev_reg_defs[0].name
-            
+
             # Mark active as FULL and False
             tags = active_rev_reg_def.tags
             tags["state"] = RevRegDefState.STATE_FULL
@@ -789,7 +863,7 @@ class AnonCredsRevocation:
                 active_rev_reg_def.value,
                 tags,
             )
-            
+
             # Mark backup as active
             backup_entry = rev_reg_defs[0]
             backup_tags = backup_entry.tags
@@ -800,22 +874,70 @@ class AnonCredsRevocation:
                 backup_entry.value,
                 backup_tags,
             )
-            
-            # Extract info for creating next backup
-            issuer_id = active_rev_reg_def.value_json["issuerId"]
-            registry_type = active_rev_reg_def.value_json["revocDefType"]
-            max_cred_num = active_rev_reg_def.value_json["value"]["maxCredNum"]
-            
+
             await txn.commit()
-            
-        LOGGER.info(f"Rotated registry: previous={rev_reg_def_id}, current={backup_rev_reg_def_id}")
-            
-        # Launch background task to create new backup
-        # We do NOT await it here to avoid blocking the HTTP response and causing a timeout
-        async def _create_backup_with_retry():
-            max_attempts = 3
-            for attempt in range(1, max_attempts + 1):
-                try:
+
+        LOGGER.info(
+            "Rotated registry: previous=%s, current=%s",
+            rev_reg_def_id,
+            backup_rev_reg_def_id,
+        )
+
+        # Launch background task to create the *next* backup. We do NOT
+        # await it here to avoid blocking the HTTP response and causing a
+        # timeout.
+        self._ensure_backup_creation_started(
+            issuer_id, cred_def_id, registry_type, max_cred_num
+        )
+
+    def _ensure_backup_creation_started(
+        self, issuer_id: str, cred_def_id: str, registry_type: str, max_cred_num: int
+    ) -> None:
+        """Start creating a backup registry for cred_def_id, if not already in flight.
+
+        Safe to call from multiple concurrent rotation attempts for the same
+        cred_def_id: only the first call launches a task; the rest are
+        no-ops until that task finishes (successfully or not), so a burst of
+        failed rotations never launches redundant concurrent ledger writes.
+        """
+        if cred_def_id in self._pending_backup_creations:
+            return
+        self._pending_backup_creations.add(cred_def_id)
+
+        task = asyncio.create_task(
+            self._create_backup_with_retry(
+                issuer_id, cred_def_id, registry_type, max_cred_num
+            )
+        )
+        self._background_tasks.add(task)
+
+        def _cleanup(completed_task: asyncio.Task) -> None:
+            self._background_tasks.discard(completed_task)
+            self._pending_backup_creations.discard(cred_def_id)
+
+        task.add_done_callback(_cleanup)
+
+    async def _create_backup_with_retry(
+        self, issuer_id: str, cred_def_id: str, registry_type: str, max_cred_num: int
+    ) -> None:
+        """Create a new backup revocation registry, retrying with backoff.
+
+        Runs as a background task so a slow or failing ledger write never
+        blocks the request that triggered it. Retries with a growing delay
+        (capped) for up to a day, since the only alternative to eventually
+        succeeding here is a cred def stuck until a human runs the manual
+        /rotate endpoint.
+        """
+        base_delay = 10  # first retry after 10s
+        max_delay = 300  # never wait more than 5 minutes between attempts
+        max_total_duration = 24 * 3600  # give up only after 24h of trying
+        started_at = time.monotonic()
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                async with self._registry_creation_semaphore:
                     await self.create_and_register_revocation_registry_definition(
                         issuer_id=issuer_id,
                         cred_def_id=cred_def_id,
@@ -823,16 +945,38 @@ class AnonCredsRevocation:
                         tag=str(uuid4()),
                         max_cred_num=max_cred_num,
                     )
-                    LOGGER.info("Successfully created new backup registry in background.")
+                LOGGER.info(
+                    "Successfully created new backup registry for cred def "
+                    "%s after %d attempt(s).",
+                    cred_def_id,
+                    attempt,
+                )
+                return
+            except Exception as e:
+                elapsed = time.monotonic() - started_at
+                if elapsed >= max_total_duration:
+                    LOGGER.error(
+                        "Giving up creating backup registry for cred def %s "
+                        "after %d attempts over %.0fs. Manual rotation via "
+                        "/anoncreds/revocation/active-registry/%s/rotate will "
+                        "be required once the active registry fills up: %s",
+                        cred_def_id,
+                        attempt,
+                        elapsed,
+                        cred_def_id,
+                        e,
+                    )
                     return
-                except Exception as e:
-                    LOGGER.error("Failed to create backup registry in background (attempt %d/%d): %s", attempt, max_attempts, e)
-                    if attempt < max_attempts:
-                        await asyncio.sleep(10)
-                        
-        task = asyncio.create_task(_create_backup_with_retry())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+                delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                LOGGER.warning(
+                    "Failed to create backup registry for cred def %s "
+                    "(attempt %d, retrying in %ds): %s",
+                    cred_def_id,
+                    attempt,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
 
     async def decommission_registry(self, cred_def_id: str):
         """Decommission post-init registries and start the next registry generation."""
@@ -1018,7 +1162,7 @@ class AnonCredsRevocation:
                             raise AnonCredsRevocationError(
                                 "Error loading revocation registry definition"
                             ) from err
-                        if rev_reg_index > rev_reg_def.max_cred_num:
+                        if rev_reg_index +1 >= rev_reg_def.max_cred_num:
                             raise AnonCredsRevocationRegistryFullError(
                                 "Revocation registry is full"
                             )
@@ -1067,96 +1211,127 @@ class AnonCredsRevocation:
 
         return credential.to_json(), credential_revocation_id
 
+    def _get_issuance_lock(self, cred_def_id: str) -> asyncio.Lock:
+        """Return the process-local mutex guarding index reservation.
+
+        Serializing concurrent reservations in memory means the losing
+        coroutines wait on a plain Python object instead of holding a
+        checked-out Postgres connection inside a blocked transaction, which
+        is what exhausted the shared multitenant connection pool under
+        concurrent issuance for the same cred_def_id.
+        """
+        locks = self._runtime_state().issuance_locks
+        lock = locks.get(cred_def_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[cred_def_id] = lock
+        return lock
+
     async def _get_and_reserve_revocation_index(
         self, cred_def_id: str
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[int]]:
         """Atomically find active registry and reserve an index.
-        
+
+        Waiting for the local lock has no timeout: a waiter holds no DB
+        connection, so there is no resource cost to waiting as long as
+        needed for its turn, and giving up early would only force it to
+        re-queue at the back, starving requests under heavy same-cred-def
+        concurrency. Once the lock is held, the DB work itself is bounded
+        by a generous timeout so a genuinely stuck call can't hold the
+        lock (and therefore the whole per-cred-def queue) forever.
+
         Returns:
             (success, rev_reg_def_id, tails_file_path, rev_reg_index)
         """
-        async with self.profile.transaction() as txn:
-            lock_key = f"lock_issue_{cred_def_id}"
-            try:
-                # Try to insert lock record if not exists
-                lock_entry = await txn.handle.fetch(
-                    CATEGORY_REV_REG_DEF_LOCK, lock_key, for_update=True
+        lock = self._get_issuance_lock(cred_def_id)
+        await lock.acquire()
+
+        async def _reserve() -> Tuple[
+            bool, Optional[str], Optional[str], Optional[int]
+        ]:
+            async with self.profile.transaction() as txn:
+                rev_reg_defs = await txn.handle.fetch_all(
+                    CATEGORY_REV_REG_DEF,
+                    {
+                        "cred_def_id": cred_def_id,
+                        "active": json.dumps(True),
+                    },
+                    limit=1,
                 )
-                if not lock_entry:
-                    await txn.handle.insert(
-                        CATEGORY_REV_REG_DEF_LOCK, lock_key, value_json={"locked": True}
+
+                if not rev_reg_defs:
+                    raise AnonCredsRevocationError("No active registry")
+
+                entry = rev_reg_defs[0]
+                rev_reg_def_id = entry.name
+
+                try:
+                    rev_reg_def = RevRegDef.deserialize(entry.value_json)
+                    anoncreds_rev_reg_def = RevocationRegistryDefinition.load(
+                        entry.raw_value
                     )
-                    lock_entry = await txn.handle.fetch(
-                        CATEGORY_REV_REG_DEF_LOCK, lock_key, for_update=True
-                    )
-            except AskarError as err:
-                # A concurrent transaction may have inserted the lock record first;
-                # that's expected and we just need to wait for its row lock below.
-                # Any other Askar error is a real failure and must not be swallowed,
-                # since silently continuing here would mean proceeding without a lock.
-                if err.code != AskarErrorCode.DUPLICATE:
+                except AnoncredsError as err:
                     raise AnonCredsRevocationError(
-                        "Error acquiring issuance lock"
+                        "Error loading revocation registry definition"
                     ) from err
-                lock_entry = await txn.handle.fetch(
-                    CATEGORY_REV_REG_DEF_LOCK, lock_key, for_update=True
+
+                if entry.tags.get("state") != RevRegDefState.STATE_FINISHED:
+                    LOGGER.info(
+                        "Active registry %s is not yet FINISHED, waiting...",
+                        rev_reg_def_id,
+                    )
+                    return False, None, None, None
+
+                # Reserve index. for_update guards only against a concurrent
+                # replica; within this process the lock above already
+                # serializes access, so this fetch never queues behind other
+                # in-process requests.
+                rev_list_entry = await txn.handle.fetch(
+                    CATEGORY_REV_LIST, rev_reg_def_id, for_update=True
+                )
+                if not rev_list_entry:
+                    LOGGER.info(
+                        "Revocation registry list not found for %s yet, "
+                        "waiting for event listener to create it...",
+                        rev_reg_def_id,
+                    )
+                    return False, None, None, None
+
+                rev_info = rev_list_entry.value_json
+                rev_info_tags = rev_list_entry.tags
+                rev_reg_index = rev_info["next_index"]
+
+                if rev_reg_index + 1 >= anoncreds_rev_reg_def.max_cred_num:
+                    # It is genuinely full. Return the ID so create_credential
+                    # triggers rotation.
+                    return False, rev_reg_def_id, None, None
+
+                # Increment and save
+                rev_info["next_index"] = rev_reg_index + 1
+                await txn.handle.replace(
+                    CATEGORY_REV_LIST,
+                    rev_reg_def_id,
+                    value_json=rev_info,
+                    tags=rev_info_tags,
                 )
 
-            if not lock_entry:
-                raise AnonCredsRevocationError("Error acquiring issuance lock")
+                await txn.commit()
 
-            rev_reg_defs = await txn.handle.fetch_all(
-                CATEGORY_REV_REG_DEF,
-                {
-                    "cred_def_id": cred_def_id,
-                    "active": json.dumps(True),
-                },
-                limit=1,
-            )
-
-            if not rev_reg_defs:
-                raise AnonCredsRevocationError("No active registry")
-            
-            entry = rev_reg_defs[0]
-            rev_reg_def_id = entry.name
-            
-            try:
-                rev_reg_def = RevRegDef.deserialize(entry.value_json)
-                anoncreds_rev_reg_def = RevocationRegistryDefinition.load(entry.raw_value)
-            except AnoncredsError as err:
-                raise AnonCredsRevocationError("Error loading revocation registry definition") from err
-                
-            if entry.tags.get("state") != RevRegDefState.STATE_FINISHED:
-                LOGGER.info("Active registry %s is not yet FINISHED, waiting...", rev_reg_def_id)
-                return False, None, None, None
-
-            # Reserve index
-            rev_list_entry = await txn.handle.fetch(CATEGORY_REV_LIST, rev_reg_def_id)
-            if not rev_list_entry:
-                LOGGER.info("Revocation registry list not found for %s yet, waiting for event listener to create it...", rev_reg_def_id)
-                return False, None, None, None
-            
-            rev_info = rev_list_entry.value_json
-            rev_info_tags = rev_list_entry.tags
-            rev_reg_index = rev_info["next_index"]
-            
-            if rev_reg_index >= anoncreds_rev_reg_def.max_cred_num:
-                # It is genuinely full. Return the ID so create_credential triggers rotation.
-                return False, rev_reg_def_id, None, None
-            
-            # Increment and save
-            rev_info["next_index"] = rev_reg_index + 1
-            await txn.handle.replace(
-                CATEGORY_REV_LIST,
-                rev_reg_def_id,
-                value_json=rev_info,
-                tags=rev_info_tags,
-            )
-            
-            await txn.commit()
-            
             tails_file_path = self.get_local_tails_path(rev_reg_def)
             return True, rev_reg_def_id, tails_file_path, rev_reg_index
+
+        try:
+            return await asyncio.wait_for(_reserve(), timeout=45)
+        except asyncio.TimeoutError:
+            LOGGER.error(
+                "Revocation index reservation for cred def %s timed out "
+                "after 45s while holding the local lock; the underlying "
+                "database call is likely stuck",
+                cred_def_id,
+            )
+            return False, None, None, None
+        finally:
+            lock.release()
 
     async def create_credential(
         self,
@@ -1173,7 +1348,12 @@ class AnonCredsRevocation:
             credential_request: Credential request to create credential for
             credential_values: Values to go in credential
             revoc_reg_id: ID of the revocation registry
-            retries: number of times to retry credential creation
+            retries: number of times to retry credential creation. Delay
+                between attempts grows (5s, 15s, 45s, capped at 60s) rather
+                than a fixed 2s, since a registry can be "not ready" because
+                its ledger write is still confirming -- that can take much
+                longer than a couple of seconds, and retrying immediately
+                just spends the whole budget before it has a chance.
 
         Returns:
             A tuple of created credential and revocation id
@@ -1189,11 +1369,16 @@ class AnonCredsRevocation:
 
         for attempt in range(max(retries, 1)):
             if attempt > 0:
+                delay = min(5 * (3 ** (attempt - 1)), 60)
                 LOGGER.info(
-                    "Waiting 2s before retrying credential issuance for cred def '%s'",
+                    "Waiting %ds before retrying credential issuance for "
+                    "cred def '%s' (attempt %d/%d)",
+                    delay,
                     cred_def_id,
+                    attempt + 1,
+                    max(retries, 1),
                 )
-                await asyncio.sleep(2)
+                await asyncio.sleep(delay)
 
             if revocable:
                 success, rev_reg_def_id, tails_file_path, rev_reg_index = await self._get_and_reserve_revocation_index(cred_def_id)
