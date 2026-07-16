@@ -127,7 +127,6 @@ testpaths = "aries_cloudagent"
 addopts = """
     --quiet --junitxml=./test-reports/junit.xml
     --cov-config .coveragerc --cov=aries_cloudagent --cov-report term --cov-report xml
-    --ruff
 """
 markers = [
     "anoncreds: Tests specifically relating to AnonCreds support",
