@@ -807,14 +807,44 @@ class AnonCredsRevocation:
         is_stuck = not active_entries or (
             active_entries[0].tags.get("state") == RevRegDefState.STATE_FULL
         )
-        if is_stuck:
-            LOGGER.info(
-                "Cred def %s had no usable active registry; promoting new "
-                "backup %s to active.",
-                cred_def_id,
+        if not is_stuck:
+            return
+
+        # Guard against promoting a registry whose revocation list was never
+        # created. Normally the RevRegDefFinishedEvent listener
+        # (DefaultRevocationSetup.on_rev_reg_def) creates it, but
+        # EventBus.notify() only logs subscriber exceptions -- it never
+        # re-raises them -- so a failure there (e.g. tails upload flaking
+        # under load) leaves the rev reg def looking fine here with no
+        # CATEGORY_REV_LIST behind it. Promoting it anyway would make every
+        # future issuance for this cred def fail with "Revocation registry
+        # not found", so create the list ourselves first if it's missing.
+        if not await self.get_created_revocation_list(new_rev_reg_def_id):
+            LOGGER.warning(
+                "Backup registry %s for cred def %s has no revocation list "
+                "yet; creating it now before promoting.",
                 new_rev_reg_def_id,
+                cred_def_id,
             )
-            await self.set_active_registry(new_rev_reg_def_id)
+            try:
+                await self.create_and_register_revocation_list(new_rev_reg_def_id)
+            except AnonCredsRevocationError as err:
+                LOGGER.error(
+                    "Could not create revocation list for backup registry "
+                    "%s (cred def %s); not promoting it: %s",
+                    new_rev_reg_def_id,
+                    cred_def_id,
+                    err,
+                )
+                return
+
+        LOGGER.info(
+            "Cred def %s had no usable active registry; promoting new "
+            "backup %s to active.",
+            cred_def_id,
+            new_rev_reg_def_id,
+        )
+        await self.set_active_registry(new_rev_reg_def_id)
 
     async def _create_backup_with_retry(
         self, issuer_id: str, cred_def_id: str, registry_type: str, max_cred_num: int
@@ -895,22 +925,48 @@ class AnonCredsRevocation:
                         "cred_def_id": active_rev_reg_def.value_json["credDefId"],
                         "state": RevRegDefState.STATE_FINISHED,
                     },
-                    limit=1,
+                    limit=5,
                 )
-                if len(rev_reg_defs):
-                    backup_rev_reg_def_id = rev_reg_defs[0].name
-                else:
-                    # Nothing to rotate into right now. Mark the exhausted
-                    # registry FULL -- its `active` tag is intentionally left
-                    # untouched, since _create_credential only filters on
-                    # `active`, not `state`, and clearing it here with no
-                    # replacement ready would make every in-flight retry fail
-                    # immediately with "No active registry" instead of the
-                    # expected AnonCredsRevocationRegistryFullError. Setting
-                    # `state` here is what lets _activate_if_current_is_full
-                    # (below) later recognize this cred def as stuck once a
-                    # new backup is ready, instead of leaving it stuck
-                    # forever until a human runs the manual /rotate endpoint.
+                # Guard against promoting a backup whose revocation list was
+                # never created. Normally the RevRegDefFinishedEvent listener
+                # (DefaultRevocationSetup.on_rev_reg_def) creates it, but
+                # EventBus.notify() only logs subscriber exceptions -- it
+                # never re-raises them -- so a failure there (e.g. tails
+                # upload flaking under load) leaves a rev reg def looking
+                # like a perfectly good backup here with no CATEGORY_REV_LIST
+                # behind it. This is the primary rotation path (most
+                # rotations go through here, not through the self-heal path
+                # below), so an unguarded promotion here is what made every
+                # future issuance fail with "Revocation registry not found"
+                # until a human ran the manual /rotate endpoint. Checking a
+                # few candidates, not just the first, means one broken
+                # leftover backup doesn't block rotation when a good one is
+                # also available.
+                backup_rev_reg_def_id = None
+                for candidate in rev_reg_defs:
+                    if await self.get_created_revocation_list(candidate.name):
+                        backup_rev_reg_def_id = candidate.name
+                        break
+                    LOGGER.warning(
+                        "Skipping backup registry %s for cred def %s: no "
+                        "revocation list found for it.",
+                        candidate.name,
+                        active_rev_reg_def.value_json["credDefId"],
+                    )
+
+                if not backup_rev_reg_def_id:
+                    # Nothing usable to rotate into right now. Mark the
+                    # exhausted registry FULL -- its `active` tag is
+                    # intentionally left untouched, since _create_credential
+                    # only filters on `active`, not `state`, and clearing it
+                    # here with no replacement ready would make every
+                    # in-flight retry fail immediately with "No active
+                    # registry" instead of the expected
+                    # AnonCredsRevocationRegistryFullError. Setting `state`
+                    # here is what lets _activate_if_current_is_full (below)
+                    # later recognize this cred def as stuck once a new
+                    # backup is ready, instead of leaving it stuck forever
+                    # until a human runs the manual /rotate endpoint.
                     full_tags = active_rev_reg_def.tags
                     full_tags["state"] = RevRegDefState.STATE_FULL
                     await session.handle.replace(
@@ -1217,7 +1273,7 @@ class AnonCredsRevocation:
         credential_request: dict,
         credential_values: dict,
         *,
-        retries: int = 5,
+        retries: int = 8,
     ) -> Tuple[str, str, str]:
         """Create a credential.
 
@@ -1226,7 +1282,15 @@ class AnonCredsRevocation:
             credential_request: Credential request to create credential for
             credential_values: Values to go in credential
             revoc_reg_id: ID of the revocation registry
-            retries: number of times to retry credential creation
+            retries: number of times to retry credential creation. Default
+                and backoff cap are sized to comfortably outlast a full
+                registry rotation (up to ~240s in the worst case: two
+                sequential on-chain writes -- registry definition, then
+                revocation list -- each up to 120s, the web3.py default
+                for waiting on a besu transaction receipt). With the old
+                default (5 retries, 60s cap: ~125s total), a rotation that
+                was genuinely succeeding could still lose the race and fail
+                the caller right before finishing.
 
         Returns:
             A tuple of created credential and revocation id
@@ -1242,7 +1306,7 @@ class AnonCredsRevocation:
 
         for attempt in range(max(retries, 1)):
             if attempt > 0:
-                delay = min(5 * (3 ** (attempt - 1)), 60)
+                delay = min(5 * (3 ** (attempt - 1)), 90)
                 LOGGER.info(
                     "Waiting %ds before retrying credential issuance for "
                     "cred def '%s' (attempt %d/%d)",

@@ -902,7 +902,16 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
         test_module._BACKGROUND_TASKS.clear()
         test_module._PENDING_BACKUP_CREATIONS.clear()
 
-        mock_handle.fetch = mock.CoroutineMock(return_value=MockRevRegDefEntry())
+        def fetch_side_effect(category, *args, **kwargs):
+            # handle_full_registry now also checks CATEGORY_REV_LIST (via
+            # get_created_revocation_list) before trusting a candidate
+            # backup -- return a real-shaped list entry for that category,
+            # and the rev reg def entry for everything else.
+            if category == test_module.CATEGORY_REV_LIST:
+                return MockRevListEntry()
+            return MockRevRegDefEntry()
+
+        mock_handle.fetch = mock.CoroutineMock(side_effect=fetch_side_effect)
         mock_handle.fetch_all = mock.CoroutineMock(
             return_value=[
                 MockRevRegDefEntry(),
@@ -913,7 +922,10 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
 
         await self.revocation.handle_full_registry("test-rev-reg-def-id")
         assert mock_set_active_registry.called
-        assert mock_handle.fetch.call_count == 2
+        # 1 fetch for the active rev reg def, 1 for the CATEGORY_REV_LIST
+        # check on the first backup candidate (which now has a list, so the
+        # loop stops there), 1 to re-fetch the old active for marking FULL.
+        assert mock_handle.fetch.call_count == 3
         assert mock_handle.fetch_all.called
         assert mock_handle.replace.called
 
