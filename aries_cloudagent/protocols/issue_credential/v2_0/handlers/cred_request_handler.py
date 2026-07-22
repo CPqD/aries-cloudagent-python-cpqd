@@ -2,6 +2,7 @@
 
 from .....core.oob_processor import OobMessageProcessor
 from .....anoncreds.issuer import AnonCredsIssuerError
+from .....anoncreds.revocation import AnonCredsRevocationError
 from .....indy.issuer import IndyIssuerError
 from .....ledger.error import LedgerError
 from .....messaging.base_handler import BaseHandler, HandlerException
@@ -80,6 +81,9 @@ class V20CredRequestHandler(BaseHandler):
 
         # If auto_issue is enabled, respond immediately
         if cred_ex_record and cred_ex_record.auto_issue:
+            self._logger.info(
+                "Iniciando auto-issue para %s", cred_ex_record.cred_ex_id
+            )
             cred_issue_message = None
             try:
                 (
@@ -93,6 +97,7 @@ class V20CredRequestHandler(BaseHandler):
             except (
                 BaseModelError,
                 AnonCredsIssuerError,
+                AnonCredsRevocationError,
                 IndyIssuerError,
                 LedgerError,
                 StorageError,
@@ -110,6 +115,20 @@ class V20CredRequestHandler(BaseHandler):
                         ProblemReportReason.ISSUANCE_ABANDONED.value,  # them: vague
                     )
                 )
+            except BaseException as diag_err:  # DIAGNOSTICO TEMPORARIO
+                # BaseException (nao Exception) de proposito: e o unico jeito
+                # de enxergar asyncio.CancelledError/TimeoutError, que nao
+                # herdam de Exception a partir do Python 3.8. So loga e
+                # relanca -- nao muda o comportamento atual, so da
+                # visibilidade a uma excecao que hoje morre em silencio.
+                self._logger.error(
+                    "Excecao INESPERADA (tipo %s) emitindo credencial para %s: %s",
+                    type(diag_err).__name__,
+                    cred_ex_record.cred_ex_id if cred_ex_record else "?",
+                    diag_err,
+                    exc_info=True,
+                )
+                raise
 
             trace_event(
                 context.settings,

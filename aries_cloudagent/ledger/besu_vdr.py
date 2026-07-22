@@ -364,7 +364,7 @@ class BesuVdrLedger(BaseLedger):
             abi=self.ledgerConfig.contractAbis[CREDENTIAL_DEFINITION_REGISTRY],
         )
         call_function = contract.functions.createCredentialDefinition(cred_def)
-        tx_receipt = self._send_signed_transaction(call_function, False)
+        tx_receipt = self._send_signed_transaction(call_function)
         LOGGER.debug("Receipt: %s", tx_receipt)
 
         result = await self.fetch_credential_definition(cred_def_id)
@@ -374,8 +374,8 @@ class BesuVdrLedger(BaseLedger):
         return "besu"
 
     def _send_signed_transaction(
-        self, contractFunction: ContractFunction, includeGasInTx: bool = True
-    ) -> TxReceipt:        
+        self, contractFunction: ContractFunction
+    ) -> TxReceipt:
         nonce = self.web3.eth.get_transaction_count(self.ledgerConfig.trusteeAccount)
         chain_id = self.web3.eth.chain_id
         txParams = {
@@ -384,8 +384,14 @@ class BesuVdrLedger(BaseLedger):
             "nonce": nonce,
             "gasPrice": self.web3.eth.gas_price,
         }
-        if includeGasInTx:
-            txParams["gas"] = 3000000        
+        try:
+            estimated_gas = contractFunction.estimate_gas(txParams)
+            txParams["gas"] = int(estimated_gas * 1.2)  # 20% safety margin
+        except Exception as e:
+            LOGGER.warning(
+                "Failed to estimate gas: %s. Using fallback gas limit.", e
+            )
+            txParams["gas"] = 3000000
         tx = contractFunction.build_transaction(txParams)
         # Sign transaction
         signed_tx = self.web3.eth.account.sign_transaction(
@@ -461,7 +467,7 @@ class BesuVdrLedger(BaseLedger):
         print(f"didDoc: {didDocObj}")
         try:
             call_function = contract.functions.updateDid(didDocObj)
-            tx_receipt = self._send_signed_transaction(call_function, False)
+            tx_receipt = self._send_signed_transaction(call_function)
             LOGGER.debug("Receipt: %s", tx_receipt)
 
         except Exception as e:

@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from asyncio import shield
+from asyncio import Lock, shield, to_thread
 from typing import List, Optional, Pattern, Sequence, Tuple
 
 from base58 import alphabet
@@ -127,7 +127,17 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
         self.VALIDATOR_CONTROL_ADDRESS = None
         self.ROLE_CONTROL_ADDRESS = None
         self.REVOCATION_ADDRESS = None
-        self.REVOCATION_LIST_GAS_LIMIT = 0x1FFFFFFFFFFFFF
+        self.REVOCATION_LIST_GAS_LIMIT = 3000000
+        # Serializes nonce-fetch-through-submit for this replica. get_transaction_count
+        # reflects only *confirmed* transactions, so two concurrent writers on this
+        # same account could otherwise fetch the same nonce before either transaction
+        # is mined. Held from the nonce fetch through send_transaction_tx returning
+        # (i.e. through confirmation) in register_revocation,
+        # register_revocation_registry_definition, and _revoc_reg_entry_with_fix --
+        # not around anything else, so unrelated credential issuance/verification
+        # (which never touch the ledger) and reads (the resolve*().call() checks)
+        # are unaffected.
+        self._tx_lock = Lock()
 
     @property
     def supported_identifiers_regex(self) -> Pattern:
@@ -227,16 +237,23 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
 
         return result
 
-    async def send_transaction_tx(self, call_function) -> TxReceipt:
-        """DEPRECATED."""
-        # FIXME: remove me
+    def _send_transaction_tx_sync(self, call_function) -> TxReceipt:
+        """Synchronous body of send_transaction_tx.
+
+        Runs off the event loop (see send_transaction_tx below) since
+        web3.eth.wait_for_transaction_receipt polls synchronously for up to
+        120s (web3.py default, no timeout configured here) waiting for the
+        besu transaction to be mined -- without offloading this, that wait
+        blocks the entire ACA-Py process on this replica, not just the
+        caller, for the whole duration.
+        """
         # Sign transaction
         signed_tx = self.web3.eth.account.sign_transaction(
             call_function, private_key=self.PKEY
         )
 
         # Send transaction
-        # LOGGER.debug("Transaction: %s", signed_tx.rawTransaction)        
+        # LOGGER.debug("Transaction: %s", signed_tx.rawTransaction)
         send_tx = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
 
         # Wait for transaction receipt
@@ -250,6 +267,11 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
 
         return tx_receipt
 
+    async def send_transaction_tx(self, call_function) -> TxReceipt:
+        """DEPRECATED."""
+        # FIXME: remove me
+        return await to_thread(self._send_transaction_tx_sync, call_function)
+
     async def register_revocation(
         self, revocation_id: str, issuer_id: str, credDef_id: str
     ) -> TxReceipt:
@@ -260,21 +282,29 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
         address = self.web3.to_checksum_address(self.REVOCATION_ADDRESS)
         contract = self.web3.eth.contract(address=address, abi=abi)
         Chain_id = self.web3.eth.chain_id
-        nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
         call_function = contract.functions.createRevocation(rev_json)
-        
-        tx = call_function.build_transaction(
-            {
-                "chainId": Chain_id,
-                "from": self.ACCOUNT,
-                "nonce": nonce,
-                "gas": 3000000,
-                "gasPrice": self.web3.eth.gas_price,
-            }
-        )
 
-        LOGGER.debug("Sending contract function %s: tuple %s", call_function.fn_name, call_function.arguments)
-        tx_receipt = await self.send_transaction_tx(tx)
+        try:
+            estimated_gas = call_function.estimate_gas({"from": self.ACCOUNT})
+            gas_limit = int(estimated_gas * 1.2)  # 20% safety margin
+        except Exception as e:
+            LOGGER.warning("Failed to estimate gas: %s. Using fallback from config.", e)
+            gas_limit = int(self.REVOCATION_LIST_GAS_LIMIT)
+
+        async with self._tx_lock:
+            nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
+            tx = call_function.build_transaction(
+                {
+                    "chainId": Chain_id,
+                    "from": self.ACCOUNT,
+                    "nonce": nonce,
+                    "gas": gas_limit,
+                    "gasPrice": self.web3.eth.gas_price,
+                }
+            )
+
+            LOGGER.debug("Sending contract function %s: tuple %s", call_function.fn_name, call_function.arguments)
+            tx_receipt = await self.send_transaction_tx(tx)
 
         # receipt = contract.functions.createSchema(indy_schema).transact({"from": self.ACCOUNT})
         LOGGER.debug("Receipt: %s", tx_receipt)
@@ -546,24 +576,32 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
             address = self.web3.to_checksum_address(self.REVOCATION_ADDRESS)
             contract = self.web3.eth.contract(address=address, abi=abi)
             Chain_id = self.web3.eth.chain_id
-            nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
             LOGGER.debug(f"Creating rev reg: {indy_rev_reg_def}")
             call_function = contract.functions.createRevocationRegistry(
                 indy_rev_reg_def
             )
-            
-            tx = call_function.build_transaction(
-                {
-                    "chainId": Chain_id,
-                    "from": self.ACCOUNT,
-                    "nonce": nonce,
-                    "gas": 3000000,
-                    "gasPrice": self.web3.eth.gas_price,
-                }
-            )
 
-            LOGGER.debug("Sending contract function %s: tuple %s", call_function.fn_name, call_function.arguments)
-            tx_receipt = await self.send_transaction_tx(tx)
+            try:
+                estimated_gas = call_function.estimate_gas({"from": self.ACCOUNT})
+                gas_limit = int(estimated_gas * 1.2)  # 20% safety margin
+            except Exception as e:
+                LOGGER.warning("Failed to estimate gas: %s. Using fallback from config.", e)
+                gas_limit = int(self.REVOCATION_LIST_GAS_LIMIT)
+
+            async with self._tx_lock:
+                nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
+                tx = call_function.build_transaction(
+                    {
+                        "chainId": Chain_id,
+                        "from": self.ACCOUNT,
+                        "nonce": nonce,
+                        "gas": gas_limit,
+                        "gasPrice": self.web3.eth.gas_price,
+                    }
+                )
+
+                LOGGER.debug("Sending contract function %s: tuple %s", call_function.fn_name, call_function.arguments)
+                tx_receipt = await self.send_transaction_tx(tx)
 
             # receipt = contract.functions.createSchema(indy_schema).transact({"from": self.ACCOUNT})
             LOGGER.debug("Receipt: %s", tx_receipt)
@@ -712,7 +750,6 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
             address = self.web3.to_checksum_address(self.REVOCATION_ADDRESS)
             contract = self.web3.eth.contract(address=address, abi=abi)
             Chain_id = self.web3.eth.chain_id
-            nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
             rev_entry = {
                 "revDefId": rev_list.rev_reg_def_id,
                 "regDefType": rev_reg_def_type,
@@ -722,18 +759,29 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
             call_function = contract.functions.createOrUpdateEntry(
                 rev_entry
             )
-            tx = call_function.build_transaction(
-                {
-                    "chainId": Chain_id,
-                    "from": self.ACCOUNT,
-                    "nonce": nonce,
-                    "gas": int(self.REVOCATION_LIST_GAS_LIMIT),
-                    "gasPrice": self.web3.eth.gas_price,
-                }
-            )
 
-            LOGGER.debug("Sending contract function %s: tuple %s", call_function.fn_name, call_function.arguments)
-            rev_entry_res = await self.send_transaction_tx(tx)
+            try:
+                estimated_gas = call_function.estimate_gas({"from": self.ACCOUNT})
+                gas_limit = int(estimated_gas * 1.2)  # 20% safety margin
+            except Exception as e:
+                LOGGER.warning("Failed to estimate gas: %s. Using fallback from config.", e)
+                gas_limit = int(self.REVOCATION_LIST_GAS_LIMIT)
+
+            async with self._tx_lock:
+                nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
+                tx = call_function.build_transaction(
+                    {
+                        "chainId": Chain_id,
+                        "from": self.ACCOUNT,
+                        "nonce": nonce,
+                        "gas": gas_limit,
+                        "gasPrice": self.web3.eth.gas_price,
+                    }
+                )
+
+                LOGGER.debug("Sending contract function %s: tuple %s", call_function.fn_name, call_function.arguments)
+                rev_entry_res = await self.send_transaction_tx(tx)
+
             rev_entry_res = contract.functions.resolveEntry(
                 rev_list.rev_reg_def_id
             ).call()

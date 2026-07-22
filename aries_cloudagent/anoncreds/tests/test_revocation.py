@@ -1,3 +1,4 @@
+import asyncio
 import http
 import json
 import os
@@ -887,12 +888,30 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
     @mock.patch.object(
         test_module.AnonCredsRevocation,
         "create_and_register_revocation_registry_definition",
-        return_value="backup",
     )
     async def test_handle_full_registry(
         self, mock_create_and_register, mock_set_active_registry, mock_handle
     ):
-        mock_handle.fetch = mock.CoroutineMock(return_value=MockRevRegDefEntry())
+        mock_create_and_register.return_value = mock.MagicMock(
+            rev_reg_def_id="backup",
+            job_id="backup-job",
+        )
+        # backup creation is dispatched via module-level background-task
+        # sets; start each scenario from a clean state so this test doesn't
+        # depend on ordering relative to other tests.
+        test_module._BACKGROUND_TASKS.clear()
+        test_module._PENDING_BACKUP_CREATIONS.clear()
+
+        def fetch_side_effect(category, *args, **kwargs):
+            # handle_full_registry now also checks CATEGORY_REV_LIST (via
+            # get_created_revocation_list) before trusting a candidate
+            # backup -- return a real-shaped list entry for that category,
+            # and the rev reg def entry for everything else.
+            if category == test_module.CATEGORY_REV_LIST:
+                return MockRevListEntry()
+            return MockRevRegDefEntry()
+
+        mock_handle.fetch = mock.CoroutineMock(side_effect=fetch_side_effect)
         mock_handle.fetch_all = mock.CoroutineMock(
             return_value=[
                 MockRevRegDefEntry(),
@@ -902,16 +921,36 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
         mock_handle.replace = mock.CoroutineMock(return_value=None)
 
         await self.revocation.handle_full_registry("test-rev-reg-def-id")
-        assert mock_create_and_register.called
         assert mock_set_active_registry.called
-        assert mock_handle.fetch.call_count == 2
+        # 1 fetch for the active rev reg def, 1 for the CATEGORY_REV_LIST
+        # check on the first backup candidate (which now has a list, so the
+        # loop stops there), 1 to re-fetch the old active for marking FULL.
+        assert mock_handle.fetch.call_count == 3
         assert mock_handle.fetch_all.called
         assert mock_handle.replace.called
 
-        # no backup registry available
+        # backup creation for the *next* rotation runs in the background;
+        # wait for it before asserting it happened, and confirm cleanup.
+        assert test_module._BACKGROUND_TASKS
+        await asyncio.gather(*test_module._BACKGROUND_TASKS)
+        assert mock_create_and_register.called
+        assert not test_module._BACKGROUND_TASKS
+        assert not test_module._PENDING_BACKUP_CREATIONS
+
+        mock_create_and_register.reset_mock()
+
+        # no backup registry available: still raises immediately, but also
+        # schedules a background attempt so a *future* call has something
+        # to rotate into instead of being stuck forever.
         mock_handle.fetch_all = mock.CoroutineMock(return_value=[])
         with self.assertRaises(test_module.AnonCredsRevocationError):
             await self.revocation.handle_full_registry("test-rev-reg-def-id")
+
+        assert test_module._BACKGROUND_TASKS
+        await asyncio.gather(*test_module._BACKGROUND_TASKS)
+        assert mock_create_and_register.called
+        assert not test_module._BACKGROUND_TASKS
+        assert not test_module._PENDING_BACKUP_CREATIONS
 
     @mock.patch.object(InMemoryProfileSession, "handle")
     async def test_decommission_registry(self, mock_handle):
@@ -1084,31 +1123,50 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
                     "attr1": "value1",
                     "attr2": "value2",
                 },
-                rev_reg_def_id="test-rev-reg-def-id",
-                tails_file_path="tails-file-path",
+                revocable=True,
             )
 
-        # missing rev list
-        mock_handle.fetch = mock.CoroutineMock(
-            side_effect=[MockEntry(), MockEntry(), None, MockEntry(), MockEntry()]
+        active_registry_entry = MockEntry(
+            name="test-rev-reg-def-id", raw_value=rev_reg_def.serialize()
         )
+
+        # no active registry
+        mock_handle.fetch_all = mock.CoroutineMock(return_value=[])
+        mock_handle.fetch = mock.CoroutineMock(side_effect=[MockEntry(), MockEntry()])
         with self.assertRaises(test_module.AnonCredsRevocationError):
             await call_test_func()
-        # missing rev def
+
+        # missing rev list
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_registry_entry]
+        )
         mock_handle.fetch = mock.CoroutineMock(
-            side_effect=[MockEntry(), MockEntry(), MockEntry(), None, MockEntry()]
+            side_effect=[MockEntry(), MockEntry(), None, MockEntry()]
         )
         with self.assertRaises(test_module.AnonCredsRevocationError):
             await call_test_func()
         # missing rev key
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_registry_entry]
+        )
         mock_handle.fetch = mock.CoroutineMock(
-            side_effect=[MockEntry(), MockEntry(), MockEntry(), MockEntry(), None]
+            side_effect=[
+                MockEntry(),
+                MockEntry(),
+                MockEntry(
+                    value_json={"rev_list": rev_list.serialize(), "next_index": 0}
+                ),
+                None,
+            ]
         )
         with self.assertRaises(test_module.AnonCredsRevocationError):
             await call_test_func()
 
         # valid
         mock_handle.replace = mock.CoroutineMock(return_value=None)
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_registry_entry]
+        )
         mock_handle.fetch = mock.CoroutineMock(
             side_effect=[
                 MockEntry(),
@@ -1119,16 +1177,19 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
                         "next_index": 0,
                     }
                 ),
-                MockEntry(raw_value=rev_reg_def.serialize()),
                 MockEntry(),
             ]
         )
         await call_test_func()
         assert mock_create.called
         assert mock_handle.replace.called
-        assert mock_handle.fetch.call_count == 5
+        assert mock_handle.fetch.call_count == 4
+        assert mock_handle.fetch_all.called
 
         # revocation registry is full
+        mock_handle.fetch_all = mock.CoroutineMock(
+            return_value=[active_registry_entry]
+        )
         mock_handle.fetch = mock.CoroutineMock(
             side_effect=[
                 MockEntry(),
@@ -1139,7 +1200,6 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
                         "next_index": 101,
                     }
                 ),
-                MockEntry(raw_value=rev_reg_def.serialize()),
                 MockEntry(),
             ]
         )
@@ -1167,22 +1227,9 @@ class TestAnonCredsRevocation(IsolatedAsyncioTestCase):
                 )
             )
         )
-        self.revocation.get_or_create_active_registry = mock.CoroutineMock(
-            return_value=RevRegDefResult(
-                job_id="test-job-id",
-                revocation_registry_definition_state=RevRegDefState(
-                    state=RevRegDefState.STATE_FINISHED,
-                    revocation_registry_definition_id="active-reg-reg",
-                    revocation_registry_definition=rev_reg_def,
-                ),
-                registration_metadata={},
-                revocation_registry_definition_metadata={},
-            )
-        )
-
         # Test private funtion seperately - very large
         self.revocation._create_credential = mock.CoroutineMock(
-            return_value=({"cred": "cred"}, 98)
+            return_value=({"cred": "cred"}, "98", "active-reg-reg", 100)
         )
 
         result = await self.revocation.create_credential(
