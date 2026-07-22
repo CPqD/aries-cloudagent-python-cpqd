@@ -127,7 +127,7 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
         self.VALIDATOR_CONTROL_ADDRESS = None
         self.ROLE_CONTROL_ADDRESS = None
         self.REVOCATION_ADDRESS = None
-        self.REVOCATION_LIST_GAS_LIMIT = 0x1FFFFFFFFFFFFF
+        self.REVOCATION_LIST_GAS_LIMIT = 3000000
         # Serializes nonce-fetch-through-submit for this replica. get_transaction_count
         # reflects only *confirmed* transactions, so two concurrent writers on this
         # same account could otherwise fetch the same nonce before either transaction
@@ -284,6 +284,13 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
         Chain_id = self.web3.eth.chain_id
         call_function = contract.functions.createRevocation(rev_json)
 
+        try:
+            estimated_gas = call_function.estimate_gas({"from": self.ACCOUNT})
+            gas_limit = int(estimated_gas * 1.2)  # 20% safety margin
+        except Exception as e:
+            LOGGER.warning("Failed to estimate gas: %s. Using fallback from config.", e)
+            gas_limit = int(self.REVOCATION_LIST_GAS_LIMIT)
+
         async with self._tx_lock:
             nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
             tx = call_function.build_transaction(
@@ -291,7 +298,7 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
                     "chainId": Chain_id,
                     "from": self.ACCOUNT,
                     "nonce": nonce,
-                    "gas": 3000000,
+                    "gas": gas_limit,
                     "gasPrice": self.web3.eth.gas_price,
                 }
             )
@@ -574,6 +581,13 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
                 indy_rev_reg_def
             )
 
+            try:
+                estimated_gas = call_function.estimate_gas({"from": self.ACCOUNT})
+                gas_limit = int(estimated_gas * 1.2)  # 20% safety margin
+            except Exception as e:
+                LOGGER.warning("Failed to estimate gas: %s. Using fallback from config.", e)
+                gas_limit = int(self.REVOCATION_LIST_GAS_LIMIT)
+
             async with self._tx_lock:
                 nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
                 tx = call_function.build_transaction(
@@ -581,7 +595,7 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
                         "chainId": Chain_id,
                         "from": self.ACCOUNT,
                         "nonce": nonce,
-                        "gas": 3000000,
+                        "gas": gas_limit,
                         "gasPrice": self.web3.eth.gas_price,
                     }
                 )
@@ -746,6 +760,13 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
                 rev_entry
             )
 
+            try:
+                estimated_gas = call_function.estimate_gas({"from": self.ACCOUNT})
+                gas_limit = int(estimated_gas * 1.2)  # 20% safety margin
+            except Exception as e:
+                LOGGER.warning("Failed to estimate gas: %s. Using fallback from config.", e)
+                gas_limit = int(self.REVOCATION_LIST_GAS_LIMIT)
+
             async with self._tx_lock:
                 nonce = self.web3.eth.get_transaction_count(self.ACCOUNT)
                 tx = call_function.build_transaction(
@@ -753,7 +774,7 @@ class DIDBesuRegistry(BaseAnonCredsResolver, BaseAnonCredsRegistrar):
                         "chainId": Chain_id,
                         "from": self.ACCOUNT,
                         "nonce": nonce,
-                        "gas": int(self.REVOCATION_LIST_GAS_LIMIT),
+                        "gas": gas_limit,
                         "gasPrice": self.web3.eth.gas_price,
                     }
                 )
