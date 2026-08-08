@@ -2,7 +2,7 @@
 
 import logging
 from json.decoder import JSONDecodeError
-from typing import Mapping
+from typing import Mapping, Optional
 
 from aiohttp import web
 from aiohttp_apispec import (
@@ -57,6 +57,16 @@ from .models.detail.ld_proof import V20CredExRecordLDProofSchema
 
 LOGGER = logging.getLogger(__name__)
 
+def get_limit_offset(request: web.BaseRequest):
+    """Pega limit e offset da request para o ACA-Py 0.12."""
+    limit = request.query.get("limit")
+    offset = request.query.get("offset")
+    if limit:
+        limit = int(limit)
+    if offset:
+        offset = int(offset)
+    return limit, offset
+
 
 class V20IssueCredentialModuleResponseSchema(OpenAPISchema):
     """Response schema for v2.0 Issue Credential Module."""
@@ -65,6 +75,14 @@ class V20IssueCredentialModuleResponseSchema(OpenAPISchema):
 class V20CredExRecordListQueryStringSchema(OpenAPISchema):
     """Parameters and validators for credential exchange record list query."""
 
+    limit = fields.Int(
+        required=False,
+        metadata={"description": "Number of results to return", "example": 10},
+    )
+    offset = fields.Int(
+        required=False,
+        metadata={"description": "Offset for pagination", "example": 0},
+    )
     connection_id = fields.Str(
         required=False,
         metadata={"description": "Connection identifier", "example": UUID4_EXAMPLE},
@@ -108,6 +126,7 @@ class V20CredExRecordDetailSchema(OpenAPISchema):
 
     indy = fields.Nested(V20CredExRecordIndySchema, required=False)
     ld_proof = fields.Nested(V20CredExRecordLDProofSchema, required=False)
+    vc_di = fields.Nested(V20CredExRecordSchema, required=False)
 
 
 class V20CredExRecordListResultSchema(OpenAPISchema):
@@ -187,10 +206,11 @@ class V20CredFilterSchema(OpenAPISchema):
     def validate_fields(self, data, **kwargs):
         """Validate schema fields.
 
-        Data must have indy, ld_proof, or both.
+        Data must have indy, ld_proof, vc_di, or all.
 
         Args:
             data: The data to validate
+            kwargs: Additional keyword arguments
 
         Raises:
             ValidationError: if data has neither indy nor ld_proof
@@ -198,7 +218,7 @@ class V20CredFilterSchema(OpenAPISchema):
         """
         if not any(f.api in data for f in V20CredFormat.Format):
             raise ValidationError(
-                "V20CredFilterSchema requires indy, ld_proof, or both"
+                "V20CredFilterSchema requires indy, ld_proof, vc_di or all"
             )
 
 
@@ -239,11 +259,13 @@ class V20IssueCredSchemaCore(AdminAPIMessageTracingSchema):
 
     @validates_schema
     def validate(self, data, **kwargs):
-        """Make sure preview is present when indy format is present."""
+        """Make sure preview is present when indy/vc_di format is present."""
 
-        if data.get("filter", {}).get("indy") and not data.get("credential_preview"):
+        if (
+            data.get("filter", {}).get("indy") or data.get("filter", {}).get("vc_di")
+        ) and not data.get("credential_preview"):
             raise ValidationError(
-                "Credential preview is required if indy filter is present"
+                "Credential preview is required if indy or vc_di filter is present"
             )
 
 
@@ -515,12 +537,15 @@ async def credential_exchange_list(request: web.BaseRequest):
         for k in ("connection_id", "role", "state")
         if request.query.get(k, "") != ""
     }
+    limit, offset = get_limit_offset(request)
 
     try:
         async with profile.session() as session:
             cred_ex_records = await V20CredExRecord.query(
                 session=session,
                 tag_filter=tag_filter,
+                limit=limit,
+                offset=offset,
                 post_filter_positive=post_filter,
             )
 
@@ -583,8 +608,7 @@ async def credential_exchange_retrieve(request: web.BaseRequest):
 @docs(
     tags=["issue-credential v2.0"],
     summary=(
-        "Create a credential record without "
-        "sending (generally for use with Out-Of-Band)"
+        "Create a credential record without sending (generally for use with Out-Of-Band)"
     ),
 )
 @request_schema(V20IssueCredSchemaCore())
@@ -621,9 +645,7 @@ async def credential_exchange_create(request: web.BaseRequest):
 
     try:
         # Not all formats use credential preview
-        cred_preview = (
-            V20CredPreview.deserialize(preview_spec) if preview_spec else None
-        )
+        cred_preview = V20CredPreview.deserialize(preview_spec) if preview_spec else None
         cred_proposal = V20CredProposal(
             comment=comment,
             credential_preview=cred_preview,
@@ -705,9 +727,7 @@ async def credential_exchange_send(request: web.BaseRequest):
     cred_ex_record = None
     try:
         # Not all formats use credential preview
-        cred_preview = (
-            V20CredPreview.deserialize(preview_spec) if preview_spec else None
-        )
+        cred_preview = V20CredPreview.deserialize(preview_spec) if preview_spec else None
         async with profile.session() as session:
             conn_record = await ConnRecord.retrieve_by_id(session, connection_id)
         if not conn_record.is_ready:
@@ -813,9 +833,7 @@ async def credential_exchange_send_proposal(request: web.BaseRequest):
     conn_record = None
     cred_ex_record = None
     try:
-        cred_preview = (
-            V20CredPreview.deserialize(preview_spec) if preview_spec else None
-        )
+        cred_preview = V20CredPreview.deserialize(preview_spec) if preview_spec else None
         async with profile.session() as session:
             conn_record = await ConnRecord.retrieve_by_id(session, connection_id)
         if not conn_record.is_ready:
@@ -859,14 +877,14 @@ async def credential_exchange_send_proposal(request: web.BaseRequest):
 
 async def _create_free_offer(
     profile: Profile,
-    filt_spec: Mapping = None,
-    connection_id: str = None,
+    filt_spec: Optional[Mapping] = None,
+    connection_id: Optional[str] = None,
     auto_issue: bool = False,
     auto_remove: bool = False,
-    replacement_id: str = None,
-    preview_spec: dict = None,
-    comment: str = None,
-    trace_msg: bool = None,
+    replacement_id: Optional[str] = None,
+    preview_spec: Optional[dict] = None,
+    comment: Optional[str] = None,
+    trace_msg: Optional[bool] = None,
 ):
     """Create a credential offer and related exchange record."""
 
@@ -892,11 +910,17 @@ async def _create_free_offer(
     )
 
     cred_manager = V20CredManager(profile)
-    (cred_ex_record, cred_offer_message) = await cred_manager.create_offer(
-        cred_ex_record,
-        comment=comment,
-        replacement_id=replacement_id,
-    )
+    try:
+        (cred_ex_record, cred_offer_message) = await cred_manager.create_offer(
+            cred_ex_record,
+            comment=comment,
+            replacement_id=replacement_id,
+        )
+    except ValueError as err:
+        LOGGER.exception(f"Error creating credential offer: {err}")
+        async with profile.session() as session:
+            await cred_ex_record.save_error_state(session, reason=err)
+        raise web.HTTPBadRequest(reason=err)
 
     return (cred_ex_record, cred_offer_message)
 
@@ -1159,7 +1183,7 @@ async def credential_exchange_send_bound_offer(request: web.BaseRequest):
             outbound_handler,
         )
     except LinkedDataProofException as err:
-        raise web.HTTPBadRequest(reason=err) from err
+        raise web.HTTPBadRequest(reason=str(err)) from err
 
     await outbound_handler(cred_offer_message, connection_id=connection_id)
 
@@ -1472,9 +1496,7 @@ async def credential_exchange_issue(request: web.BaseRequest):
             outbound_handler,
         )
 
-    await outbound_handler(
-        cred_issue_message, connection_id=cred_ex_record.connection_id
-    )
+    await outbound_handler(cred_issue_message, connection_id=cred_ex_record.connection_id)
 
     trace_event(
         context.settings,
